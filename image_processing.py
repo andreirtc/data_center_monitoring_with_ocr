@@ -254,6 +254,40 @@ def draw_document_detection(
 
     return result
 
+def draw_measurement_boxes(
+    image: np.ndarray,
+    measurement_boxes: list[dict],
+) -> np.ndarray:
+    """
+    Draw all expected temperature and humidity cells.
+
+    Temperature cells are green.
+    Humidity cells are orange.
+    """
+
+    result = image.copy()
+
+    for box in measurement_boxes:
+        x1 = box["x1"]
+        y1 = box["y1"]
+        x2 = box["x2"]
+        y2 = box["y2"]
+
+        if box["reading_type"] == "temperature":
+            color = (0, 255, 0)
+        else:
+            color = (0, 165, 255)
+
+        cv2.rectangle(
+            result,
+            (x1, y1),
+            (x2, y2),
+            color,
+            2,
+        )
+
+    return result
+
 def order_corners(
     contour: np.ndarray,
 ) -> np.ndarray:

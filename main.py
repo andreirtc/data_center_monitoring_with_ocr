@@ -21,6 +21,7 @@ from image_processing import (
     convert_to_grayscale,
     detect_edges,
     draw_document_detection,
+    draw_measurement_boxes,
     find_table_contour,
     load_image,
     resize_to_maximum_width,
@@ -28,6 +29,7 @@ from image_processing import (
     warp_perspective,
 )
 
+from table_layout import build_measurement_boxes
 
 def main() -> None:
     """Run the current document-processing pipeline."""
@@ -158,6 +160,48 @@ def main() -> None:
         output_height=STANDARD_TABLE_HEIGHT,
     )
 
+    warped_height, warped_width = warped_table.shape[:2]
+
+
+    # 11. Build the expected measurement grid
+
+    measurement_boxes = build_measurement_boxes(
+        image_width=warped_width,
+        image_height=warped_height,
+    )
+
+    print(
+        f"Generated {len(measurement_boxes)} "
+        f"measurement boxes."
+    )
+
+    print(
+        "First measurement box:",
+        measurement_boxes[0],
+    )
+
+    print(
+        "Last measurement box:",
+        measurement_boxes[-1],
+    )
+
+    # 12. Draw and save the grid overlay
+
+    grid_overlay = draw_measurement_boxes(
+        image=warped_table,
+        measurement_boxes=measurement_boxes,
+    )
+
+    save_image(
+        grid_overlay,
+        OUTPUT_FOLDER / "measurement_grid_overlay.png",
+    )
+
+    cv2.imshow(
+        "Measurement Grid Overlay",
+        grid_overlay,
+    )
+
     save_image(
         warped_table,
         OUTPUT_FOLDER / "warped_table.png",
@@ -175,7 +219,7 @@ def main() -> None:
         warped_table,
     )
 
-    # 12. Display the outputs
+    # 13. Display the outputs
 
     cv2.imshow(
         "Raw Canny Edges",
