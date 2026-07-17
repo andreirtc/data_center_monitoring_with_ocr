@@ -37,6 +37,7 @@ from image_processing import (
 
 from table_layout import build_measurement_boxes
 from cell_extraction import extract_selected_cells
+from cell_preprocessing import create_preprocessing_comparison
 
 def main() -> None:
     """Run the current document-processing pipeline."""
@@ -257,8 +258,60 @@ def main() -> None:
             "->",
             extracted_cell["output_path"],
         )
+    
+    # -----------------------------------------------------
+    # CREATE SIDE-BY-SIDE PREPROCESSING COMPARISONS
+    # -----------------------------------------------------
 
-    # Display the first extracted cell as a quick check.
+    comparison_folder = (
+        OUTPUT_FOLDER / "preprocessing_comparisons"
+    )
+
+    comparison_folder.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    first_comparison = None
+
+    for extracted_cell in extracted_cells:
+        comparison_image = create_preprocessing_comparison(
+            cell_image=extracted_cell["image"],
+            preview_scale=4,
+        )
+
+        original_filename = extracted_cell["filename"]
+
+        comparison_filename = (
+            original_filename
+            .replace(".png", "_comparison.png")
+        )
+
+        comparison_path = (
+            comparison_folder
+            / comparison_filename
+        )
+
+        save_image(
+            comparison_image,
+            comparison_path,
+        )
+
+        if first_comparison is None:
+            first_comparison = comparison_image
+
+    print(
+        f"Created {len(extracted_cells)} "
+        f"preprocessing comparison images."
+    )
+
+    if first_comparison is not None:
+        cv2.imshow(
+            "Cell Preprocessing Comparison",
+            first_comparison,
+        )
+
+# Display the first extracted cell as a quick check.
     if extracted_cells:
         first_cell = extracted_cells[0]
 
