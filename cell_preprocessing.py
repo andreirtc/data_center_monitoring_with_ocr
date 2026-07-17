@@ -177,13 +177,14 @@ def add_panel_label(
 
     return labelled_panel
 
-
-def create_preprocessing_comparison(
+def create_ocr_variants(
     cell_image: np.ndarray,
-    preview_scale: int = 4,
-) -> np.ndarray:
+) -> dict[str, np.ndarray]:
     """
-    Build one horizontal image comparing all processing variants.
+    Create the preprocessing versions that will be tested by OCR.
+
+    The line-removed version is intentionally excluded because
+    our visual test showed that it damages handwritten digits.
     """
 
     grayscale_image = convert_cell_to_grayscale(
@@ -198,15 +199,34 @@ def create_preprocessing_comparison(
         contrast_image
     )
 
+    return {
+        "original": cell_image.copy(),
+        "grayscale": grayscale_image,
+        "contrast": contrast_image,
+        "binary": binary_image,
+    }
+
+def create_preprocessing_comparison(
+    cell_image: np.ndarray,
+    preview_scale: int = 4,
+) -> np.ndarray:
+    """
+    Build one horizontal image comparing all processing variants.
+    """
+
+    ocr_variants = create_ocr_variants(
+        cell_image
+    )
+
     line_removed_image = remove_table_lines(
-        binary_image
+        ocr_variants["binary"]
     )
 
     variants = [
-        ("Original", cell_image),
-        ("Grayscale", grayscale_image),
-        ("Contrast", contrast_image),
-        ("Binary", binary_image),
+        ("Original", ocr_variants["original"]),
+        ("Grayscale", ocr_variants["grayscale"]),
+        ("Contrast", ocr_variants["contrast"]),
+        ("Binary", ocr_variants["binary"]),
         ("Lines removed", line_removed_image),
     ]
 
