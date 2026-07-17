@@ -7,6 +7,8 @@ from config import (
     MINIMUM_TABLE_AREA_RATIO,
     OUTPUT_FOLDER,
     POLYGON_APPROXIMATION_RATIO,
+    STANDARD_TABLE_HEIGHT,
+    STANDARD_TABLE_WIDTH,
     TABLE_ROI_BOTTOM_RATIO,
     TABLE_ROI_LEFT_RATIO,
     TABLE_ROI_RIGHT_RATIO,
@@ -122,40 +124,58 @@ def main() -> None:
     else:
         print("Table border detected successfully.")
 
-        warped_table = warp_perspective(
-            resized_image,
-            table_contour,
-        )
-
-        save_image(
-            warped_table,
-            OUTPUT_FOLDER / "warped_table.png",
-        )
-
-        warped_height, warped_width = warped_table.shape[:2]
-
-        print(
-            f"Warped table size: "
-            f"{warped_width} x {warped_height}"
-        )
-
-        cv2.imshow(
-            "Warped Table",
-            warped_table,
-        )
-
         corners = table_contour.reshape(4, 2)
 
-        for number, (x, y) in enumerate(
-            corners,
-            start=1,
-        ):
+        for number, (x, y) in enumerate(corners, start=1):
             print(
-                f"Corner {number}: "
-                f"x={int(x)}, y={int(y)}"
-            )
+            f"Corner {number}: "
+            f"x={int(x)}, y={int(y)}"
+        )
+    
+    #10. Map the detected corners back to the original image
 
-    # 10. Display the outputs
+    # The table contour was detected from resized_image.
+    # We need to convert those coordinates so they match
+    # the original high-resolution image.
+    original_width = original_image.shape[1]
+    resized_width = resized_image.shape[1]
+
+    resize_scale = resized_width / original_width
+
+    print(f"Detection resize scale: {resize_scale:.4f}")
+
+    original_table_contour = (
+        table_contour.astype("float32")
+        / resize_scale
+    )
+
+    # 11. Warp the original high-resolution image
+
+    warped_table = warp_perspective(
+        image=original_image,
+        contour=original_table_contour,
+        output_width=STANDARD_TABLE_WIDTH,
+        output_height=STANDARD_TABLE_HEIGHT,
+    )
+
+    save_image(
+        warped_table,
+        OUTPUT_FOLDER / "warped_table.png",
+    )
+
+    warped_height, warped_width = warped_table.shape[:2]
+
+    print(
+        f"Standardized warped table size: "
+        f"{warped_width} x {warped_height}"
+    )
+
+    cv2.imshow(
+        "High-Resolution Warped Table",
+        warped_table,
+    )
+
+    # 12. Display the outputs
 
     cv2.imshow(
         "Raw Canny Edges",

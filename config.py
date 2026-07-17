@@ -24,3 +24,7 @@ MINIMUM_TABLE_AREA_RATIO = 0.25
 
 # Controls how strongly OpenCV simplifies a contour into corners.
 POLYGON_APPROXIMATION_RATIO = 0.02
+
+# Final standardized table dimensions used for cell extraction and OCR.
+STANDARD_TABLE_WIDTH = 2400
+STANDARD_TABLE_HEIGHT = 1260

@@ -291,48 +291,35 @@ def order_corners(
 def warp_perspective(
     image: np.ndarray,
     contour: np.ndarray,
+    output_width: int,
+    output_height: int,
 ) -> np.ndarray:
     """
-    Transform an angled four-corner table into a flat rectangle.
+    Transform an angled four-corner table into a standardized
+    flat rectangular image.
+
+    Args:
+        image:
+            The original image that will be transformed.
+
+        contour:
+            Four corner points representing the table boundary.
+
+        output_width:
+            Width of the standardized output image.
+
+        output_height:
+            Height of the standardized output image.
+
+    Returns:
+        The perspective-corrected table image.
     """
 
-    corners = order_corners(contour)
-
-    top_left = corners[0]
-    top_right = corners[1]
-    bottom_right = corners[2]
-    bottom_left = corners[3]
-
-    top_width = np.linalg.norm(
-        top_right - top_left
+    ordered_corners = order_corners(
+        contour
     )
 
-    bottom_width = np.linalg.norm(
-        bottom_right - bottom_left
-    )
-
-    output_width = int(
-        max(top_width, bottom_width)
-    )
-
-    left_height = np.linalg.norm(
-        bottom_left - top_left
-    )
-
-    right_height = np.linalg.norm(
-        bottom_right - top_right
-    )
-
-    output_height = int(
-        max(left_height, right_height)
-    )
-
-    if output_width <= 0 or output_height <= 0:
-        raise ValueError(
-            "The calculated perspective output size is invalid."
-        )
-
-    destination = np.array(
+    destination_corners = np.array(
         [
             [0, 0],
             [output_width - 1, 0],
@@ -343,14 +330,15 @@ def warp_perspective(
     )
 
     transformation_matrix = cv2.getPerspectiveTransform(
-        corners,
-        destination,
+        ordered_corners,
+        destination_corners,
     )
 
     warped_image = cv2.warpPerspective(
         image,
         transformation_matrix,
         (output_width, output_height),
+        flags=cv2.INTER_CUBIC,
     )
 
     return warped_image
