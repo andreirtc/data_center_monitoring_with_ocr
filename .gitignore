@@ -13,8 +13,7 @@ test_images/*
 output/*
 !output/.gitkeep
 
-learning_exercises/*
-!learning_exercises/.gitkeep
+/learning_exercises/
 
 # Local environment and editor files
 .env
