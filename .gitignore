@@ -1,0 +1,25 @@
+# Virtual environment
+.venv/
+
+# Python-generated files
+__pycache__/
+*.py[cod]
+
+# Company forms and test photographs
+test_images/*
+!test_images/.gitkeep
+
+# Generated processing outputs
+output/*
+!output/.gitkeep
+
+learning_exercises/*
+!learning_exercises/.gitkeep
+
+# Local environment and editor files
+.env
+.vscode/
+
+# Operating-system files
+Thumbs.db
+.DS_Store
