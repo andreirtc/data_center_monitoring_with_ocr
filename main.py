@@ -23,6 +23,7 @@ from image_processing import (
     load_image,
     resize_to_maximum_width,
     save_image,
+    warp_perspective,
 )
 
 
@@ -120,6 +121,28 @@ def main() -> None:
 
     else:
         print("Table border detected successfully.")
+
+        warped_table = warp_perspective(
+            resized_image,
+            table_contour,
+        )
+
+        save_image(
+            warped_table,
+            OUTPUT_FOLDER / "warped_table.png",
+        )
+
+        warped_height, warped_width = warped_table.shape[:2]
+
+        print(
+            f"Warped table size: "
+            f"{warped_width} x {warped_height}"
+        )
+
+        cv2.imshow(
+            "Warped Table",
+            warped_table,
+        )
 
         corners = table_contour.reshape(4, 2)
 

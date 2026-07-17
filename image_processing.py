@@ -254,6 +254,106 @@ def draw_document_detection(
 
     return result
 
+def order_corners(
+    contour: np.ndarray,
+) -> np.ndarray:
+    """
+    Return four contour points in this order:
+
+    1. top-left
+    2. top-right
+    3. bottom-right
+    4. bottom-left
+    """
+
+    points = contour.reshape(4, 2).astype(np.float32)
+
+    ordered = np.zeros(
+        (4, 2),
+        dtype=np.float32,
+    )
+
+    coordinate_sums = points.sum(axis=1)
+
+    ordered[0] = points[np.argmin(coordinate_sums)]
+    ordered[2] = points[np.argmax(coordinate_sums)]
+
+    coordinate_differences = np.diff(
+        points,
+        axis=1,
+    ).reshape(-1)
+
+    ordered[1] = points[np.argmin(coordinate_differences)]
+    ordered[3] = points[np.argmax(coordinate_differences)]
+
+    return ordered
+
+def warp_perspective(
+    image: np.ndarray,
+    contour: np.ndarray,
+) -> np.ndarray:
+    """
+    Transform an angled four-corner table into a flat rectangle.
+    """
+
+    corners = order_corners(contour)
+
+    top_left = corners[0]
+    top_right = corners[1]
+    bottom_right = corners[2]
+    bottom_left = corners[3]
+
+    top_width = np.linalg.norm(
+        top_right - top_left
+    )
+
+    bottom_width = np.linalg.norm(
+        bottom_right - bottom_left
+    )
+
+    output_width = int(
+        max(top_width, bottom_width)
+    )
+
+    left_height = np.linalg.norm(
+        bottom_left - top_left
+    )
+
+    right_height = np.linalg.norm(
+        bottom_right - top_right
+    )
+
+    output_height = int(
+        max(left_height, right_height)
+    )
+
+    if output_width <= 0 or output_height <= 0:
+        raise ValueError(
+            "The calculated perspective output size is invalid."
+        )
+
+    destination = np.array(
+        [
+            [0, 0],
+            [output_width - 1, 0],
+            [output_width - 1, output_height - 1],
+            [0, output_height - 1],
+        ],
+        dtype=np.float32,
+    )
+
+    transformation_matrix = cv2.getPerspectiveTransform(
+        corners,
+        destination,
+    )
+
+    warped_image = cv2.warpPerspective(
+        image,
+        transformation_matrix,
+        (output_width, output_height),
+    )
+
+    return warped_image
 
 def save_image(
     image: np.ndarray,
