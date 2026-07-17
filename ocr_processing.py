@@ -1,4 +1,5 @@
 from __future__ import annotations
+from collections.abc import Callable
 
 import json
 import re
@@ -424,3 +425,58 @@ def process_measurement_cells(
         )
 
     return final_results
+
+def process_measurement_cells_in_batches(
+    model: TextRecognition,
+    cells: list[dict[str, Any]],
+    cells_per_batch: int = 32,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> list[CellOCRResult]:
+    """
+    Process a large collection of cells in smaller batches.
+
+    This reduces memory usage and supports progress reporting
+    in both command-line scripts and the future Streamlit app.
+    """
+
+    if cells_per_batch <= 0:
+        raise ValueError(
+            "cells_per_batch must be greater than zero."
+        )
+
+    all_results: list[CellOCRResult] = []
+
+    total_cells = len(cells)
+
+    for start_index in range(
+        0,
+        total_cells,
+        cells_per_batch,
+    ):
+        end_index = min(
+            start_index + cells_per_batch,
+            total_cells,
+        )
+
+        cell_batch = cells[
+            start_index:end_index
+        ]
+
+        batch_results = process_measurement_cells(
+            model=model,
+            cells=cell_batch,
+        )
+
+        all_results.extend(
+            batch_results
+        )
+
+        processed_count = end_index
+
+        if progress_callback is not None:
+            progress_callback(
+                processed_count,
+                total_cells,
+            )
+
+    return all_results
