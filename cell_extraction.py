@@ -98,6 +98,47 @@ def create_cell_filename(
         f"{reading_type}.png"
     )
 
+def extract_measurement_cells(
+    image: np.ndarray,
+    measurement_boxes: list[dict],
+    horizontal_margin_ratio: float,
+    vertical_margin_ratio: float,
+    top_padding_ratio: float,
+    bottom_padding_ratio: float,
+) -> list[dict]:
+    """
+    Extract every measurement cell from a warped monitoring table.
+
+    Unlike extract_selected_cells(), this function does not save
+    images to disk. It returns the crops in memory so they can be
+    passed directly to OCR or Streamlit.
+    """
+
+    extracted_cells = []
+
+    for measurement_box in measurement_boxes:
+        cropped_cell = crop_measurement_cell(
+            image=image,
+            measurement_box=measurement_box,
+            horizontal_margin_ratio=horizontal_margin_ratio,
+            vertical_margin_ratio=vertical_margin_ratio,
+            top_padding_ratio=top_padding_ratio,
+            bottom_padding_ratio=bottom_padding_ratio,
+        )
+
+        filename = create_cell_filename(
+            measurement_box
+        )
+
+        extracted_cells.append(
+            {
+                **measurement_box,
+                "filename": filename,
+                "image": cropped_cell,
+            }
+        )
+
+    return extracted_cells
 
 def extract_selected_cells(
     image: np.ndarray,
