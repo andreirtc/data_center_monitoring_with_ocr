@@ -28,3 +28,20 @@ POLYGON_APPROXIMATION_RATIO = 0.02
 # Final standardized table dimensions used for cell extraction and OCR.
 STANDARD_TABLE_WIDTH = 2400
 STANDARD_TABLE_HEIGHT = 1260
+
+# Inner margins used when cropping handwritten values.
+#
+# These exclude most printed cell borders while retaining
+# the handwritten digits and decimal points.
+CELL_HORIZONTAL_MARGIN_RATIO = 0.00
+CELL_VERTICAL_MARGIN_RATIO = 0.00
+
+# Extend the crop beyond the printed row border.
+# The bottom receives more allowance because handwriting
+# commonly drops below the baseline.
+CELL_TOP_PADDING_RATIO = 0.03
+CELL_BOTTOM_PADDING_RATIO = 0.06
+
+# Small controlled sample used while calibrating extraction.
+SAMPLE_DAYS = [1, 2, 3]
+SAMPLE_POINTS = [1, 2, 3]

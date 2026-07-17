@@ -14,6 +14,12 @@ from config import (
     TABLE_ROI_RIGHT_RATIO,
     TABLE_ROI_TOP_RATIO,
     TEST_IMAGE_PATH,
+    CELL_HORIZONTAL_MARGIN_RATIO,
+    CELL_VERTICAL_MARGIN_RATIO,
+    CELL_TOP_PADDING_RATIO,
+    CELL_BOTTOM_PADDING_RATIO,
+    SAMPLE_DAYS,
+    SAMPLE_POINTS,
 )
 
 from image_processing import (
@@ -30,6 +36,7 @@ from image_processing import (
 )
 
 from table_layout import build_measurement_boxes
+from cell_extraction import extract_selected_cells
 
 def main() -> None:
     """Run the current document-processing pipeline."""
@@ -218,6 +225,57 @@ def main() -> None:
         "High-Resolution Warped Table",
         warped_table,
     )
+
+    # -----------------------------------------------------
+    # EXTRACT A SMALL CONTROLLED SAMPLE OF CELLS
+    # -----------------------------------------------------
+
+    sample_cells_folder = (
+        OUTPUT_FOLDER / "sample_cells"
+    )
+
+    extracted_cells = extract_selected_cells(
+        image=warped_table,
+        measurement_boxes=measurement_boxes,
+        selected_days=SAMPLE_DAYS,
+        selected_points=SAMPLE_POINTS,
+        output_folder=sample_cells_folder,
+        horizontal_margin_ratio=CELL_HORIZONTAL_MARGIN_RATIO,
+        vertical_margin_ratio=CELL_VERTICAL_MARGIN_RATIO,
+        top_padding_ratio=CELL_TOP_PADDING_RATIO,
+        bottom_padding_ratio=CELL_BOTTOM_PADDING_RATIO,
+    )
+
+    print(
+        f"Extracted {len(extracted_cells)} "
+        f"sample measurement cells."
+    )
+
+    for extracted_cell in extracted_cells:
+        print(
+            extracted_cell["filename"],
+            "->",
+            extracted_cell["output_path"],
+        )
+
+    # Display the first extracted cell as a quick check.
+    if extracted_cells:
+        first_cell = extracted_cells[0]
+
+        # Enlarge it only for viewing.
+        # The original saved crop remains unchanged.
+        preview = cv2.resize(
+            first_cell["image"],
+            None,
+            fx=4,
+            fy=4,
+            interpolation=cv2.INTER_NEAREST,
+        )
+
+        cv2.imshow(
+            f"Sample Cell - {first_cell['filename']}",
+            preview,
+        )
 
     # 13. Display the outputs
 
