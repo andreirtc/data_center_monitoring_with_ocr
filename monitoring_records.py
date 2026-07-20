@@ -104,6 +104,16 @@ def build_monitoring_rows(
                     "humidity": humidity.final_value,
                     "needs_review": row_needs_review,
 
+                    "temperature_is_blank": (
+                        temperature.is_blank
+                    ),
+                    "humidity_is_blank": (
+                        humidity.is_blank
+                    ),
+                    "row_is_blank": (
+                        temperature.is_blank
+                        and humidity.is_blank
+                    ),
                     "temperature_needs_review": (
                         temperature.needs_review
                     ),
@@ -145,6 +155,7 @@ def build_monitoring_rows(
                     "humidity_filename": (
                         humidity.filename
                     ),
+                    
                 }
             )
 

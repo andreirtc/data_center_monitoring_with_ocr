@@ -4,7 +4,8 @@ from collections.abc import Callable
 import json
 import re
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from blank_cell_detection import analyze_cell_for_blankness
 from typing import Any
 
 import cv2
@@ -47,6 +48,8 @@ class CellOCRResult:
     final_value: str
     needs_review: bool
     review_reason: str
+    is_blank: bool = False
+    blank_ink_ratio: float = 0.0
 
 
 def normalize_numeric_text(
@@ -480,3 +483,156 @@ def process_measurement_cells_in_batches(
             )
 
     return all_results
+
+def process_measurement_cells_with_blank_detection(
+    model: TextRecognition,
+    cells: list[dict[str, Any]],
+    cells_per_batch: int = 32,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> list[CellOCRResult]:
+    """
+    Classify blank cells before OCR.
+
+    Blank cells receive an empty final value and are not submitted
+    to PaddleOCR. Filled cells continue through the normal
+    multi-variant recognition pipeline.
+    """
+
+    if not cells:
+        return []
+
+    total_cells = len(cells)
+
+    filled_cells = []
+    blank_results: dict[str, CellOCRResult] = {}
+    ink_ratios: dict[str, float] = {}
+
+    for cell in cells:
+        blank_analysis = analyze_cell_for_blankness(
+            cell["image"]
+        )
+
+        filename = cell["filename"]
+
+        ink_ratios[filename] = round(
+            blank_analysis.ink_ratio,
+            6,
+        )
+
+        if not blank_analysis.is_blank:
+            filled_cells.append(cell)
+            continue
+
+        blank_results[filename] = CellOCRResult(
+            filename=filename,
+            day=cell["day"],
+            point=cell["point"],
+            reading_type=cell["reading_type"],
+
+            predictions={
+                "original": "",
+                "grayscale": "",
+                "contrast": "",
+            },
+
+            confidences={
+                "original": 0.0,
+                "grayscale": 0.0,
+                "contrast": 0.0,
+            },
+
+            consensus_prediction="",
+            agreement_count=0,
+            average_consensus_confidence=0.0,
+
+            final_value="",
+            needs_review=False,
+            review_reason="Cell classified as blank.",
+
+            is_blank=True,
+            blank_ink_ratio=ink_ratios[filename],
+        )
+
+    blank_count = len(blank_results)
+
+    print(
+        f"Blank-cell detector skipped "
+        f"{blank_count}/{total_cells} cells."
+    )
+
+    print(
+        f"Submitting {len(filled_cells)} "
+        f"filled cells to OCR."
+    )
+
+    # Blank cells are already considered processed.
+    if progress_callback is not None:
+        progress_callback(
+            blank_count,
+            total_cells,
+        )
+
+    def report_filled_progress(
+        processed_filled_count: int,
+        total_filled_count: int,
+    ) -> None:
+        """
+        Convert filled-cell progress into whole-sheet progress.
+        """
+
+        del total_filled_count
+
+        if progress_callback is not None:
+            progress_callback(
+                blank_count + processed_filled_count,
+                total_cells,
+            )
+
+    filled_results = (
+        process_measurement_cells_in_batches(
+            model=model,
+            cells=filled_cells,
+            cells_per_batch=cells_per_batch,
+            progress_callback=report_filled_progress,
+        )
+    )
+
+    result_by_filename = dict(
+        blank_results
+    )
+
+    for result in filled_results:
+        result_with_blank_score = replace(
+            result,
+            is_blank=False,
+            blank_ink_ratio=ink_ratios[
+                result.filename
+            ],
+        )
+
+        result_by_filename[
+            result.filename
+        ] = result_with_blank_score
+
+    # Restore the original table-cell order.
+    ordered_results = []
+
+    for cell in cells:
+        filename = cell["filename"]
+
+        if filename not in result_by_filename:
+            raise RuntimeError(
+                f"No result was generated for {filename}."
+            )
+
+        ordered_results.append(
+            result_by_filename[filename]
+        )
+
+    if len(ordered_results) != total_cells:
+        raise RuntimeError(
+            "The number of final results does not match "
+            "the number of extracted cells."
+        )
+
+    return ordered_results

@@ -20,7 +20,7 @@ from monitoring_records import (
 )
 from ocr_processing import (
     CellOCRResult,
-    process_measurement_cells_in_batches,
+    process_measurement_cells_with_blank_detection,
 )
 from sheet_processing import (
     prepare_monitoring_sheet,
@@ -87,6 +87,8 @@ def save_cell_results(
         "day",
         "point",
         "reading_type",
+        "is_blank",
+        "blank_ink_ratio",
 
         "original_prediction",
         "grayscale_prediction",
@@ -124,6 +126,10 @@ def save_cell_results(
                     "day": result.day,
                     "point": result.point,
                     "reading_type": result.reading_type,
+                    "is_blank": result.is_blank,
+                    "blank_ink_ratio": (
+                        result.blank_ink_ratio
+                    ),
 
                     "original_prediction": (
                         result.predictions["original"]
@@ -269,7 +275,7 @@ def main() -> None:
     start_time = time.perf_counter()
 
     cell_results = (
-        process_measurement_cells_in_batches(
+        process_measurement_cells_with_blank_detection(
             model=model,
             cells=prepared_sheet.cells,
             cells_per_batch=(
@@ -315,10 +321,25 @@ def main() -> None:
         cells=prepared_sheet.cells,
     )
 
+    blank_cell_count = sum(
+        1
+        for result in cell_results
+        if result.is_blank
+    )
+
+    ocr_processed_count = sum(
+        1
+        for result in cell_results
+        if not result.is_blank
+    )
+
     automatically_accepted_count = sum(
         1
         for result in cell_results
-        if not result.needs_review
+        if (
+            not result.is_blank
+            and not result.needs_review
+        )
     )
 
     review_row_count = sum(
@@ -337,7 +358,17 @@ def main() -> None:
     )
 
     print(
-        f"Automatically accepted cells: "
+        f"Blank cells skipped: "
+        f"{blank_cell_count}"
+    )
+
+    print(
+        f"Filled cells sent to OCR: "
+        f"{ocr_processed_count}"
+    )
+
+    print(
+        f"Automatically accepted filled cells: "
         f"{automatically_accepted_count}"
     )
 
