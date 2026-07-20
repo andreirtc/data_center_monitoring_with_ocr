@@ -4,6 +4,12 @@ import hashlib
 import time
 from typing import Any
 
+import re
+from dataclasses import replace
+from datacenter_ocr.numeric_postprocessing import (
+    is_valid_value,
+)
+
 import cv2
 import numpy as np
 import pandas as pd
@@ -185,6 +191,111 @@ def count_accepted_filled_cells(
         )
     )
 
+def validate_manual_value(
+    raw_value: str,
+    reading_type: str,
+) -> tuple[str | None, str | None]:
+    """
+    Validate a manually entered temperature or humidity value.
+
+    Returns:
+        normalized value and no error, or
+        no value and an error message.
+    """
+
+    cleaned_value = (
+        raw_value
+        .strip()
+        .replace(",", ".")
+    )
+
+    if not cleaned_value:
+        return None, None
+
+    # Accept whole numbers or values with exactly
+    # one digit after the decimal point.
+    if re.fullmatch(
+        r"-?\d+(?:\.\d)?",
+        cleaned_value,
+    ) is None:
+        return (
+            None,
+            "Use a number with no more than one "
+            "decimal place, such as 21.7.",
+        )
+
+    normalized_value = (
+        f"{float(cleaned_value):.1f}"
+    )
+
+    if not is_valid_value(
+        normalized_value,
+        reading_type,
+    ):
+        if reading_type == "temperature":
+            valid_range = "10.0 to 50.0"
+        else:
+            valid_range = "0.0 to 100.0"
+
+        return (
+            None,
+            f"The value must be within "
+            f"{valid_range}.",
+        )
+
+    return normalized_value, None
+
+
+def apply_manual_corrections(
+    results: list[CellOCRResult],
+    corrections: dict[str, str],
+) -> list[CellOCRResult]:
+    """
+    Apply verified values without modifying the original
+    CellOCRResult objects in place.
+    """
+
+    updated_results = []
+
+    for result in results:
+        corrected_value = corrections.get(
+            result.filename
+        )
+
+        if corrected_value is None:
+            updated_results.append(
+                result
+            )
+
+            continue
+
+        updated_result = replace(
+            result,
+            final_value=corrected_value,
+            needs_review=False,
+            review_reason=(
+                "Manually verified by the user."
+            ),
+        )
+
+        updated_results.append(
+            updated_result
+        )
+
+    return updated_results
+
+
+def build_cell_image_lookup(
+    prepared_sheet: PreparedMonitoringSheet,
+) -> dict[str, np.ndarray]:
+    """
+    Map each generated filename to its extracted cell image.
+    """
+
+    return {
+        cell["filename"]: cell["image"]
+        for cell in prepared_sheet.cells
+    }
 
 st.title(
     "Data Center Monthly Monitoring OCR"
@@ -563,30 +674,241 @@ if (
         )
 
     with review_tab:
-        review_rows = [
-            row
-            for row in monitoring_rows
-            if row["needs_review"]
+        review_results = [
+            result
+            for result in cell_results
+            if result.needs_review
         ]
 
-        if not review_rows:
+        if not review_results:
             st.success(
-                "No monitoring rows require manual review."
+                "All detected readings have been reviewed."
             )
+
         else:
             st.warning(
-                f"{len(review_rows)} monitoring rows "
+                f"{len(review_results)} individual readings "
                 f"require manual verification."
             )
 
-            review_dataframe = (
-                create_display_dataframe(
-                    review_rows
+            st.caption(
+                "You may correct only some items and save them. "
+                "Unfilled items will remain in the review list."
+            )
+
+            cell_image_lookup = (
+                build_cell_image_lookup(
+                    prepared_sheet
                 )
             )
 
-            st.dataframe(
-                review_dataframe,
-                use_container_width=True,
-                hide_index=True,
-            )
+            correction_inputs: dict[
+                str,
+                str,
+            ] = {}
+
+            with st.form(
+                "manual_review_form"
+            ):
+                for result in review_results:
+                    with st.container(
+                        border=True
+                    ):
+                        st.markdown(
+                            f"### Day {result.day} — "
+                            f"Point {result.point} — "
+                            f"{result.reading_type.title()}"
+                        )
+
+                        image_column, details_column = (
+                            st.columns(
+                                [1, 2]
+                            )
+                        )
+
+                        with image_column:
+                            cell_image = (
+                                cell_image_lookup[
+                                    result.filename
+                                ]
+                            )
+
+                            st.image(
+                                convert_bgr_to_rgb(
+                                    cell_image
+                                ),
+                                caption=(
+                                    "Extracted handwritten cell"
+                                ),
+                                use_container_width=True,
+                            )
+
+                        with details_column:
+                            consensus_text = (
+                                result.consensus_prediction
+                                or "(empty)"
+                            )
+
+                            st.markdown(
+                                f"**OCR consensus:** "
+                                f"`{consensus_text}`"
+                            )
+
+                            st.markdown(
+                                "**Variant predictions:**"
+                            )
+
+                            st.write(
+                                "Original:",
+                                result.predictions[
+                                    "original"
+                                ]
+                                or "(empty)",
+                            )
+
+                            st.write(
+                                "Grayscale:",
+                                result.predictions[
+                                    "grayscale"
+                                ]
+                                or "(empty)",
+                            )
+
+                            st.write(
+                                "Contrast:",
+                                result.predictions[
+                                    "contrast"
+                                ]
+                                or "(empty)",
+                            )
+
+                            st.write(
+                                f"Agreement: "
+                                f"{result.agreement_count}/3"
+                            )
+
+                            st.write(
+                                f"Reason: "
+                                f"{result.review_reason}"
+                            )
+
+                            correction_inputs[
+                                result.filename
+                            ] = st.text_input(
+                                "Verified value",
+                                value="",
+                                placeholder=(
+                                    "Example: 53.3"
+                                ),
+                                key=(
+                                    "review_"
+                                    f"{uploaded_fingerprint}_"
+                                    f"{result.filename}"
+                                ),
+                            )
+
+                save_corrections_clicked = (
+                    st.form_submit_button(
+                        "Save verified values",
+                        type="primary",
+                    )
+                )
+
+            if save_corrections_clicked:
+                valid_corrections = {}
+                validation_errors = []
+
+                for result in review_results:
+                    raw_value = correction_inputs[
+                        result.filename
+                    ]
+
+                    # Empty inputs are intentionally skipped.
+                    if not raw_value.strip():
+                        continue
+
+                    (
+                        normalized_value,
+                        validation_error,
+                    ) = validate_manual_value(
+                        raw_value=raw_value,
+                        reading_type=(
+                            result.reading_type
+                        ),
+                    )
+
+                    if validation_error is not None:
+                        validation_errors.append(
+                            (
+                                f"Day {result.day}, "
+                                f"Point {result.point}, "
+                                f"{result.reading_type.title()}: "
+                                f"{validation_error}"
+                            )
+                        )
+
+                        continue
+
+                    if normalized_value is not None:
+                        valid_corrections[
+                            result.filename
+                        ] = normalized_value
+
+                if validation_errors:
+                    st.error(
+                        "Some entered values are invalid."
+                    )
+
+                    for validation_error in (
+                        validation_errors
+                    ):
+                        st.write(
+                            f"- {validation_error}"
+                        )
+
+                elif not valid_corrections:
+                    st.warning(
+                        "Enter at least one verified value "
+                        "before saving."
+                    )
+
+                else:
+                    updated_cell_results = (
+                        apply_manual_corrections(
+                            results=cell_results,
+                            corrections=(
+                                valid_corrections
+                            ),
+                        )
+                    )
+
+                    updated_monitoring_rows = (
+                        build_monitoring_rows(
+                            updated_cell_results
+                        )
+                    )
+
+                    st.session_state[
+                        "cell_results"
+                    ] = updated_cell_results
+
+                    st.session_state[
+                        "monitoring_rows"
+                    ] = updated_monitoring_rows
+
+                    remaining_review_count = sum(
+                        1
+                        for result
+                        in updated_cell_results
+                        if result.needs_review
+                    )
+
+                    st.success(
+                        f"Saved "
+                        f"{len(valid_corrections)} "
+                        f"verified value(s). "
+                        f"{remaining_review_count} "
+                        f"review item(s) remain."
+                    )
+
+                    st.rerun()
