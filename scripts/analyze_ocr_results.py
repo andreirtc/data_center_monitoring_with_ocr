@@ -4,8 +4,7 @@ import csv
 from collections import Counter, defaultdict
 from pathlib import Path
 
-
-PROJECT_FOLDER = Path(__file__).resolve().parent
+from datacenter_ocr.config import PROJECT_FOLDER
 
 REPORT_PATH = (
     PROJECT_FOLDER

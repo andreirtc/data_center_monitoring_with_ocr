@@ -7,22 +7,22 @@ from typing import Any
 
 from paddleocr import TextRecognition
 
-from config import (
+from datacenter_ocr.config import (
     OUTPUT_FOLDER,
     TEST_IMAGE_PATH,
 )
-from image_processing import (
+from datacenter_ocr.image_processing import (
     load_image,
     save_image,
 )
-from monitoring_records import (
+from datacenter_ocr.monitoring_records import (
     build_monitoring_rows,
 )
-from ocr_processing import (
+from datacenter_ocr.ocr_processing import (
     CellOCRResult,
     process_measurement_cells_with_blank_detection,
 )
-from sheet_processing import (
+from datacenter_ocr.sheet_processing import (
     prepare_monitoring_sheet,
 )
 

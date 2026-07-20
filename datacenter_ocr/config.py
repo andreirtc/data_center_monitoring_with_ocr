@@ -2,7 +2,7 @@ from pathlib import Path
 
 
 # Folder containing this project.
-PROJECT_FOLDER = Path(__file__).resolve().parent
+PROJECT_FOLDER = Path(__file__).resolve().parent.parent
 
 # Input and output locations.
 TEST_IMAGE_PATH = PROJECT_FOLDER / "test_images" / "sample.png"

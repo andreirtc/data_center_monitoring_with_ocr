@@ -2,18 +2,18 @@ from __future__ import annotations
 
 import csv
 
-from blank_cell_detection import (
+from datacenter_ocr.blank_cell_detection import (
     analyze_cell_for_blankness,
 )
-from config import (
+from datacenter_ocr.config import (
     OUTPUT_FOLDER,
     TEST_IMAGE_PATH,
 )
-from image_processing import (
+from datacenter_ocr.image_processing import (
     load_image,
     save_image,
 )
-from sheet_processing import (
+from datacenter_ocr.sheet_processing import (
     prepare_monitoring_sheet,
 )
 

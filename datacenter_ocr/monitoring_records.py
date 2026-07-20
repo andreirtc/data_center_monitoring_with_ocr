@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ocr_processing import CellOCRResult
+from datacenter_ocr.ocr_processing import CellOCRResult
 
 
 EXPECTED_DAY_COUNT = 31

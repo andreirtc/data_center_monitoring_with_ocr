@@ -3,13 +3,12 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 
-from numeric_postprocessing import (
+from datacenter_ocr.numeric_postprocessing import (
     correct_numeric_prediction,
     infer_reading_type,
 )
 
-
-PROJECT_FOLDER = Path(__file__).resolve().parent
+from datacenter_ocr.config import PROJECT_FOLDER
 
 ENSEMBLE_REPORT_PATH = (
     PROJECT_FOLDER

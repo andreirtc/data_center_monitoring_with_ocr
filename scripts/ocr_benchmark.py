@@ -12,10 +12,9 @@ import cv2
 import numpy as np
 from paddleocr import TextRecognition
 
-from cell_preprocessing import create_ocr_variants
+from datacenter_ocr.cell_preprocessing import create_ocr_variants
 
-
-PROJECT_FOLDER = Path(__file__).resolve().parent
+from datacenter_ocr.config import PROJECT_FOLDER
 
 SAMPLE_CELLS_FOLDER = (
     PROJECT_FOLDER

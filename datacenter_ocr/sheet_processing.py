@@ -4,8 +4,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from cell_extraction import extract_measurement_cells
-from config import (
+from datacenter_ocr.cell_extraction import extract_measurement_cells
+from datacenter_ocr.config import (
     CANNY_HIGH_THRESHOLD,
     CANNY_LOW_THRESHOLD,
     CELL_BOTTOM_PADDING_RATIO,
@@ -22,7 +22,7 @@ from config import (
     TABLE_ROI_RIGHT_RATIO,
     TABLE_ROI_TOP_RATIO,
 )
-from image_processing import (
+from datacenter_ocr.image_processing import (
     connect_edges,
     convert_to_grayscale,
     detect_edges,
@@ -32,7 +32,7 @@ from image_processing import (
     resize_to_maximum_width,
     warp_perspective,
 )
-from table_layout import build_measurement_boxes
+from datacenter_ocr.table_layout import build_measurement_boxes
 
 
 @dataclass

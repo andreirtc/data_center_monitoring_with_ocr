@@ -9,10 +9,9 @@ from typing import Any
 import cv2
 from paddleocr import TextRecognition
 
-from ocr_processing import process_measurement_cells
+from datacenter_ocr.ocr_processing import process_measurement_cells
 
-
-PROJECT_FOLDER = Path(__file__).resolve().parent
+from datacenter_ocr.config import PROJECT_FOLDER
 
 SAMPLE_CELLS_FOLDER = (
     PROJECT_FOLDER

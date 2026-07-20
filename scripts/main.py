@@ -1,6 +1,6 @@
 import cv2
 
-from config import (
+from datacenter_ocr.config import (
     CANNY_HIGH_THRESHOLD,
     CANNY_LOW_THRESHOLD,
     MAXIMUM_IMAGE_WIDTH,
@@ -22,7 +22,7 @@ from config import (
     SAMPLE_POINTS,
 )
 
-from image_processing import (
+from datacenter_ocr.image_processing import (
     connect_edges,
     convert_to_grayscale,
     detect_edges,
@@ -35,9 +35,9 @@ from image_processing import (
     warp_perspective,
 )
 
-from table_layout import build_measurement_boxes
-from cell_extraction import extract_selected_cells
-from cell_preprocessing import create_preprocessing_comparison
+from datacenter_ocr.table_layout import build_measurement_boxes
+from datacenter_ocr.cell_extraction import extract_selected_cells
+from datacenter_ocr.cell_preprocessing import create_preprocessing_comparison
 
 def main() -> None:
     """Run the current document-processing pipeline."""

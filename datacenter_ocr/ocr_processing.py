@@ -5,15 +5,15 @@ import json
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
-from blank_cell_detection import analyze_cell_for_blankness
+from datacenter_ocr.blank_cell_detection import analyze_cell_for_blankness
 from typing import Any
 
 import cv2
 import numpy as np
 from paddleocr import TextRecognition
 
-from cell_preprocessing import create_ocr_variants
-from numeric_postprocessing import correct_numeric_prediction
+from datacenter_ocr.cell_preprocessing import create_ocr_variants
+from datacenter_ocr.numeric_postprocessing import correct_numeric_prediction
 
 
 PRODUCTION_VARIANTS = (
