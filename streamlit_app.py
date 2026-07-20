@@ -8,7 +8,13 @@ import re
 from dataclasses import replace
 from datacenter_ocr.numeric_postprocessing import (
     is_valid_value,
+    validate_final_reading,
 )
+
+from datacenter_ocr.excel_export import (
+    create_monitoring_workbook,
+)
+
 
 import cv2
 import numpy as np
@@ -116,6 +122,7 @@ def clear_previous_results() -> None:
         "monitoring_rows",
         "processing_seconds",
         "processed_fingerprint",
+        "table_editor_version",
     ]
 
     for key in keys_to_remove:
@@ -249,15 +256,30 @@ def validate_manual_value(
 def apply_manual_corrections(
     results: list[CellOCRResult],
     corrections: dict[str, str],
+    verified_blank_filenames: set[str],
 ) -> list[CellOCRResult]:
     """
-    Apply verified values without modifying the original
-    CellOCRResult objects in place.
+    Apply manually verified numeric values or blank-cell decisions.
     """
 
     updated_results = []
 
     for result in results:
+        if result.filename in verified_blank_filenames:
+            updated_results.append(
+                replace(
+                    result,
+                    final_value="",
+                    needs_review=False,
+                    review_reason=(
+                        "Manually verified as a blank cell."
+                    ),
+                    is_blank=True,
+                )
+            )
+
+            continue
+
         corrected_value = corrections.get(
             result.filename
         )
@@ -269,17 +291,16 @@ def apply_manual_corrections(
 
             continue
 
-        updated_result = replace(
-            result,
-            final_value=corrected_value,
-            needs_review=False,
-            review_reason=(
-                "Manually verified by the user."
-            ),
-        )
-
         updated_results.append(
-            updated_result
+            replace(
+                result,
+                final_value=corrected_value,
+                needs_review=False,
+                review_reason=(
+                    "Manually verified by the user."
+                ),
+                is_blank=False,
+            )
         )
 
     return updated_results
@@ -296,6 +317,330 @@ def build_cell_image_lookup(
         cell["filename"]: cell["image"]
         for cell in prepared_sheet.cells
     }
+
+def revalidate_cell_results(
+    results: list[CellOCRResult],
+) -> list[CellOCRResult]:
+    """
+    Validate every OCR result using the final workbook rules.
+
+    This catches malformed automatically accepted values such
+    as '22.' that did not previously appear in Review items.
+    """
+
+    validated_results = []
+
+    for result in results:
+        if result.is_blank:
+            validated_results.append(
+                replace(
+                    result,
+                    final_value="",
+                )
+            )
+
+            continue
+
+        normalized_value, validation_error = (
+            validate_final_reading(
+                value=result.final_value,
+                reading_type=result.reading_type,
+            )
+        )
+
+        if validation_error is not None:
+            existing_reason = (
+                result.review_reason.strip()
+            )
+
+            validation_reason = (
+                "Final validation: "
+                f"{validation_error}"
+            )
+
+            if (
+                existing_reason
+                and validation_reason
+                not in existing_reason
+            ):
+                combined_reason = (
+                    f"{existing_reason} "
+                    f"{validation_reason}"
+                )
+            else:
+                combined_reason = (
+                    validation_reason
+                )
+
+            validated_results.append(
+                replace(
+                    result,
+                    needs_review=True,
+                    review_reason=combined_reason,
+                )
+            )
+
+            continue
+
+        validated_results.append(
+            replace(
+                result,
+                final_value=(
+                    normalized_value
+                    if normalized_value is not None
+                    else ""
+                ),
+            )
+        )
+
+    return validated_results
+
+def create_editable_monitoring_dataframe(
+    monitoring_rows: list[dict[str, Any]],
+) -> pd.DataFrame:
+    """
+    Create the full editable monitoring table.
+
+    The user may correct any value, even if OCR originally
+    accepted it automatically.
+    """
+
+    dataframe = pd.DataFrame(
+        monitoring_rows
+    )
+
+    editable_dataframe = dataframe[
+        [
+            "day",
+            "point",
+            "temperature",
+            "humidity",
+            "temperature_is_blank",
+            "humidity_is_blank",
+            "temperature_needs_review",
+            "humidity_needs_review",
+        ]
+    ].copy()
+
+    editable_dataframe = (
+        editable_dataframe.rename(
+            columns={
+                "day": "Day",
+                "point": "Point",
+                "temperature": "Temperature",
+                "humidity": "Humidity",
+                "temperature_is_blank": (
+                    "Temperature Blank"
+                ),
+                "humidity_is_blank": (
+                    "Humidity Blank"
+                ),
+                "temperature_needs_review": (
+                    "Temperature Review"
+                ),
+                "humidity_needs_review": (
+                    "Humidity Review"
+                ),
+            }
+        )
+    )
+
+    return editable_dataframe
+
+
+def apply_monitoring_table_edits(
+    results: list[CellOCRResult],
+    edited_dataframe: pd.DataFrame,
+) -> tuple[
+    list[CellOCRResult],
+    list[str],
+    int,
+]:
+    """
+    Apply user edits from the complete monitoring table.
+
+    Only changed values are marked as manually verified.
+    Unchanged OCR results retain their existing review status.
+    """
+
+    result_lookup = {
+        (
+            result.day,
+            result.point,
+            result.reading_type,
+        ): result
+        for result in results
+    }
+
+    proposed_updates: dict[
+        tuple[int, int, str],
+        CellOCRResult,
+    ] = {}
+
+    validation_errors = []
+    changed_count = 0
+
+    for _, dataframe_row in (
+        edited_dataframe.iterrows()
+    ):
+        day = int(
+            dataframe_row["Day"]
+        )
+
+        point = int(
+            dataframe_row["Point"]
+        )
+
+        reading_settings = [
+            (
+                "temperature",
+                "Temperature",
+                "Temperature Blank",
+            ),
+            (
+                "humidity",
+                "Humidity",
+                "Humidity Blank",
+            ),
+        ]
+
+        for (
+            reading_type,
+            value_column,
+            blank_column,
+        ) in reading_settings:
+            key = (
+                day,
+                point,
+                reading_type,
+            )
+
+            current_result = result_lookup[
+                key
+            ]
+
+            manually_blank = bool(
+                dataframe_row[blank_column]
+            )
+
+            raw_value = dataframe_row[
+                value_column
+            ]
+
+            if manually_blank:
+                proposed_value = ""
+                proposed_is_blank = True
+
+            else:
+                (
+                    normalized_value,
+                    validation_error,
+                ) = validate_final_reading(
+                    value=raw_value,
+                    reading_type=reading_type,
+                )
+
+                if validation_error is not None:
+                    validation_errors.append(
+                        (
+                            f"Day {day}, Point {point}, "
+                            f"{reading_type.title()}: "
+                            f"{validation_error}"
+                        )
+                    )
+
+                    continue
+
+                if normalized_value is None:
+                    validation_errors.append(
+                        (
+                            f"Day {day}, Point {point}, "
+                            f"{reading_type.title()}: "
+                            "enter a value or mark the "
+                            "cell as blank."
+                        )
+                    )
+
+                    continue
+
+                proposed_value = normalized_value
+                proposed_is_blank = False
+
+            value_changed = (
+                str(current_result.final_value)
+                != proposed_value
+            )
+
+            blank_status_changed = (
+                current_result.is_blank
+                != proposed_is_blank
+            )
+
+            if not (
+                value_changed
+                or blank_status_changed
+            ):
+                proposed_updates[key] = (
+                    current_result
+                )
+
+                continue
+
+            changed_count += 1
+
+            if proposed_is_blank:
+                updated_reason = (
+                    "Manually verified as blank "
+                    "in the monitoring table."
+                )
+            else:
+                updated_reason = (
+                    "Manually verified in the "
+                    "editable monitoring table."
+                )
+
+            proposed_updates[key] = replace(
+                current_result,
+                final_value=proposed_value,
+                is_blank=proposed_is_blank,
+                needs_review=False,
+                review_reason=updated_reason,
+            )
+
+    # Do not apply partial table changes when any
+    # validation error exists.
+    if validation_errors:
+        return (
+            results,
+            validation_errors,
+            0,
+        )
+
+    updated_results = []
+
+    for result in results:
+        key = (
+            result.day,
+            result.point,
+            result.reading_type,
+        )
+
+        updated_results.append(
+            proposed_updates.get(
+                key,
+                result,
+            )
+        )
+
+    updated_results = revalidate_cell_results(
+        updated_results
+    )
+
+    return (
+        updated_results,
+        [],
+        changed_count,
+    )
 
 st.title(
     "Data Center Monthly Monitoring OCR"
@@ -474,6 +819,10 @@ if process_button_clicked:
                 )
             )
 
+            cell_results = revalidate_cell_results(
+                cell_results
+            )
+
             monitoring_rows = (
                 build_monitoring_rows(
                     cell_results
@@ -621,11 +970,12 @@ if (
         f"contain at least one review item."
     )
 
-    preview_tab, table_tab, review_tab = st.tabs(
+    preview_tab, table_tab, review_tab, export_tab = st.tabs(
         [
             "Sheet previews",
             "Monitoring table",
             "Review items",
+            "Export Excel",
         ]
     )
 
@@ -663,15 +1013,218 @@ if (
             )
 
     with table_tab:
-        display_dataframe = create_display_dataframe(
-            monitoring_rows
+        st.subheader(
+            "Editable monitoring table"
         )
 
-        st.dataframe(
-            display_dataframe,
+        st.write(
+            "Review and correct any reading directly in the "
+            "table. Day and Point are locked. You may also "
+            "mark incorrectly detected readings as blank."
+        )
+
+        invalid_or_review_count = sum(
+            1
+            for result in cell_results
+            if result.needs_review
+        )
+
+        if invalid_or_review_count:
+            st.warning(
+                f"{invalid_or_review_count} reading(s) "
+                "currently require attention."
+            )
+        else:
+            st.success(
+                "All values currently pass final validation."
+            )
+
+        show_attention_only = st.checkbox(
+            "Show only rows requiring attention",
+            value=False,
+            key=(
+                "show_attention_"
+                f"{uploaded_fingerprint}"
+            ),
+        )
+
+        editable_dataframe = (
+            create_editable_monitoring_dataframe(
+                monitoring_rows
+            )
+        )
+
+        if show_attention_only:
+            editable_dataframe = (
+                editable_dataframe[
+                    (
+                        editable_dataframe[
+                            "Temperature Review"
+                        ]
+                    )
+                    |
+                    (
+                        editable_dataframe[
+                            "Humidity Review"
+                        ]
+                    )
+                ].copy()
+            )
+
+        editor_version = (
+            st.session_state.get(
+                "table_editor_version",
+                0,
+            )
+        )
+
+        edited_dataframe = st.data_editor(
+            editable_dataframe,
             use_container_width=True,
             hide_index=True,
+            disabled=[
+                "Day",
+                "Point",
+                "Temperature Review",
+                "Humidity Review",
+            ],
+            column_config={
+                "Day": st.column_config.NumberColumn(
+                    "Day",
+                    format="%d",
+                ),
+                "Point": st.column_config.NumberColumn(
+                    "Point",
+                    format="%d",
+                ),
+                "Temperature": (
+                    st.column_config.TextColumn(
+                        "Temperature",
+                        help=(
+                            "Use exactly one decimal place, "
+                            "such as 22.0."
+                        ),
+                    )
+                ),
+                "Humidity": (
+                    st.column_config.TextColumn(
+                        "Humidity",
+                        help=(
+                            "Use exactly one decimal place, "
+                            "such as 53.3."
+                        ),
+                    )
+                ),
+                "Temperature Blank": (
+                    st.column_config.CheckboxColumn(
+                        "Temp Blank",
+                        help=(
+                            "Check when the temperature "
+                            "cell is actually empty."
+                        ),
+                    )
+                ),
+                "Humidity Blank": (
+                    st.column_config.CheckboxColumn(
+                        "Humidity Blank",
+                        help=(
+                            "Check when the humidity "
+                            "cell is actually empty."
+                        ),
+                    )
+                ),
+                "Temperature Review": (
+                    st.column_config.CheckboxColumn(
+                        "Temp Review",
+                    )
+                ),
+                "Humidity Review": (
+                    st.column_config.CheckboxColumn(
+                        "Humidity Review",
+                    )
+                ),
+            },
+            key=(
+                "monitoring_editor_"
+                f"{uploaded_fingerprint}_"
+                f"{editor_version}"
+            ),
         )
+
+        save_table_changes_clicked = st.button(
+            "Save monitoring table changes",
+            type="primary",
+            key=(
+                "save_table_"
+                f"{uploaded_fingerprint}"
+            ),
+        )
+
+        if save_table_changes_clicked:
+            (
+                updated_cell_results,
+                table_validation_errors,
+                changed_count,
+            ) = apply_monitoring_table_edits(
+                results=cell_results,
+                edited_dataframe=edited_dataframe,
+            )
+
+            if table_validation_errors:
+                st.error(
+                    "Some table values could not be saved."
+                )
+
+                for table_error in (
+                    table_validation_errors
+                ):
+                    st.write(
+                        f"- {table_error}"
+                    )
+
+                st.info(
+                    "Correct the highlighted value, then press "
+                    "Enter or click outside the cell again."
+                )
+
+            elif changed_count > 0:
+                updated_monitoring_rows = (
+                    build_monitoring_rows(
+                        updated_cell_results
+                    )
+                )
+
+                st.session_state[
+                    "cell_results"
+                ] = updated_cell_results
+
+                st.session_state[
+                    "monitoring_rows"
+                ] = updated_monitoring_rows
+
+                st.session_state[
+                    "table_editor_version"
+                ] = (
+                    editor_version + 1
+                )
+
+                remaining_review_count = sum(
+                    1
+                    for result in updated_cell_results
+                    if result.needs_review
+                )
+
+                st.toast(
+                    f"Saved {changed_count} table change(s). {remaining_review_count} reading(s) still require attention."
+                )
+
+                st.rerun()
+
+            else:
+                st.caption(
+                    "Changes save automatically after you press "
+                    "Enter, press Tab, or click outside the cell."
+                )
 
     with review_tab:
         review_results = [
@@ -707,8 +1260,14 @@ if (
                 str,
             ] = {}
 
+            blank_inputs: dict[
+                str,
+                bool,
+            ] = {}
+
             with st.form(
-                "manual_review_form"
+                "manual_review_form",
+                enter_to_submit=True,
             ):
                 for result in review_results:
                     with st.container(
@@ -807,6 +1366,17 @@ if (
                                 ),
                             )
 
+                            blank_inputs[
+                                result.filename
+                            ] = st.checkbox(
+                                "This cell is actually blank",
+                                key=(
+                                    "review_blank_"
+                                    f"{uploaded_fingerprint}_"
+                                    f"{result.filename}"
+                                ),
+                            )
+
                 save_corrections_clicked = (
                     st.form_submit_button(
                         "Save verified values",
@@ -816,9 +1386,17 @@ if (
 
             if save_corrections_clicked:
                 valid_corrections = {}
+                verified_blank_filenames = set()
                 validation_errors = []
 
                 for result in review_results:
+                    if blank_inputs[result.filename]:
+                        verified_blank_filenames.add(
+                            result.filename
+                        )
+
+                        continue
+
                     raw_value = correction_inputs[
                         result.filename
                     ]
@@ -866,19 +1444,29 @@ if (
                             f"- {validation_error}"
                         )
 
-                elif not valid_corrections:
-                    st.warning(
-                        "Enter at least one verified value "
-                        "before saving."
+                elif (
+                    not valid_corrections
+                    and not verified_blank_filenames
+                ):
+                    st.info(
+                        "No verified values were entered. "
+                        "Nothing was saved."
                     )
 
                 else:
                     updated_cell_results = (
                         apply_manual_corrections(
                             results=cell_results,
-                            corrections=(
-                                valid_corrections
+                            corrections=valid_corrections,
+                            verified_blank_filenames=(
+                                verified_blank_filenames
                             ),
+                        )
+                    )
+
+                    updated_cell_results = (
+                        revalidate_cell_results(
+                            updated_cell_results
                         )
                     )
 
@@ -905,10 +1493,113 @@ if (
 
                     st.success(
                         f"Saved "
-                        f"{len(valid_corrections)} "
-                        f"verified value(s). "
+                        f"{len(valid_corrections)} value correction(s) and "
+                        f"{len(verified_blank_filenames)} "
+                        f"blank-cell confirmation(s). "
                         f"{remaining_review_count} "
                         f"review item(s) remain."
                     )
 
                     st.rerun()
+
+    with export_tab:
+        st.subheader(
+            "Export final company workbook"
+        )
+
+        unresolved_results = [
+            result
+            for result in cell_results
+            if result.needs_review
+        ]
+
+        if unresolved_results:
+            st.warning(
+                f"{len(unresolved_results)} reading(s) "
+                "still require correction or verification."
+            )
+
+            st.write(
+                "Complete all review items before "
+                "downloading the final Excel file."
+            )
+
+        else:
+            st.success(
+                "All flagged readings have been reviewed."
+            )
+
+            st.write(
+                "The exported workbook will use the official "
+                "company template and preserve its logo, "
+                "formatting, formulas, borders, and print layout."
+            )
+
+            month_year_value = st.text_input(
+                "Month/Year",
+                placeholder=(
+                    "Example: July 2026"
+                ),
+                key=(
+                    "export_month_year_"
+                    f"{uploaded_fingerprint}"
+                ),
+            )
+
+            final_values_confirmed = st.checkbox(
+                "I have reviewed the final temperature "
+                "and humidity values.",
+                key=(
+                    "export_confirmed_"
+                    f"{uploaded_fingerprint}"
+                ),
+            )
+
+            if not final_values_confirmed:
+                st.info(
+                    "Review the Monitoring table, then "
+                    "confirm the values to enable download."
+                )
+
+            else:
+                try:
+                    completed_workbook = (
+                        create_monitoring_workbook(
+                            monitoring_rows=(
+                                monitoring_rows
+                            ),
+                            month_year=(
+                                month_year_value
+                            ),
+                        )
+                    )
+
+                except (
+                    ValueError,
+                    FileNotFoundError,
+                ) as error:
+                    st.error(
+                        str(error)
+                    )
+
+                else:
+                    st.download_button(
+                        label=(
+                            "Download completed Excel file"
+                        ),
+                        data=completed_workbook,
+                        file_name=(
+                            "Data_Center_Temperature_"
+                            "Monitoring_Final.xlsx"
+                        ),
+                        mime=(
+                            "application/vnd.openxmlformats-"
+                            "officedocument.spreadsheetml.sheet"
+                        ),
+                        type="primary",
+                    )
+
+                    st.caption(
+                        "The original template stored in the "
+                        "templates folder is not modified."
+                    )

@@ -45,3 +45,13 @@ CELL_BOTTOM_PADDING_RATIO = 0.06
 # Small controlled sample used while calibrating extraction.
 SAMPLE_DAYS = [1, 2, 3]
 SAMPLE_POINTS = [1, 2, 3]
+
+TEMPLATES_FOLDER = (
+    PROJECT_FOLDER
+    / "templates"
+)
+
+EXCEL_TEMPLATE_PATH = (
+    TEMPLATES_FOLDER
+    / "Toyota_Data_Center_Temperature_Monitoring_Template.xlsx"
+)

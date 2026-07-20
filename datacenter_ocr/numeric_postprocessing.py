@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import re
+
 
 TEMPERATURE_MIN = 10.0
 TEMPERATURE_MAX = 50.0
@@ -68,6 +70,64 @@ def is_valid_value(
         f"Unknown reading type: {reading_type}"
     )
 
+def validate_final_reading(
+    value: object,
+    reading_type: str,
+) -> tuple[str | None, str | None]:
+    """
+    Validate a final reading before display or export.
+
+    Returns:
+        normalized value and no error, or
+        no value and an error message.
+    """
+
+    if value is None:
+        return None, None
+
+    text = (
+        str(value)
+        .strip()
+        .replace(",", ".")
+    )
+
+    # Pandas may represent empty table cells as NaN.
+    if (
+        not text
+        or text.lower() == "nan"
+    ):
+        return None, None
+
+    # The company form requires exactly one decimal digit.
+    if re.fullmatch(
+        r"-?\d+\.\d",
+        text,
+    ) is None:
+        return (
+            None,
+            "Use exactly one decimal place, "
+            "such as 22.0 or 53.3.",
+        )
+
+    normalized_value = (
+        f"{float(text):.1f}"
+    )
+
+    if not is_valid_value(
+        normalized_value,
+        reading_type,
+    ):
+        if reading_type == "temperature":
+            valid_range = "10.0 to 50.0"
+        else:
+            valid_range = "0.0 to 100.0"
+
+        return (
+            None,
+            f"The value must be within {valid_range}.",
+        )
+
+    return normalized_value, None
 
 def trim_extra_decimal_digits(
     text: str,
