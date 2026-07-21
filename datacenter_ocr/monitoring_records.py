@@ -10,6 +10,36 @@ EXPECTED_POINT_COUNT = 8
 EXPECTED_ROW_COUNT = 248
 
 
+def attach_crop_data_urls(
+    monitoring_rows: list[dict[str, Any]],
+    crop_data_urls: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Attach reading crops by each cell's stable OCR-result filename."""
+
+    rows_with_crops: list[dict[str, Any]] = []
+    for row in monitoring_rows:
+        temperature_filename = str(row["temperature_filename"])
+        humidity_filename = str(row["humidity_filename"])
+
+        try:
+            temperature_crop = crop_data_urls[temperature_filename]
+            humidity_crop = crop_data_urls[humidity_filename]
+        except KeyError as error:
+            raise ValueError(
+                f"Missing extracted crop for {error.args[0]}."
+            ) from error
+
+        rows_with_crops.append(
+            {
+                **row,
+                "temperature_crop": temperature_crop,
+                "humidity_crop": humidity_crop,
+            }
+        )
+
+    return rows_with_crops
+
+
 def build_monitoring_rows(
     cell_results: list[CellOCRResult],
 ) -> list[dict[str, Any]]:
@@ -91,9 +121,57 @@ def build_monitoring_rows(
                 "humidity"
             ]
 
-            row_needs_review = (
-                temperature.needs_review
-                or humidity.needs_review
+            row_blocks_export = (
+                temperature.blocks_export
+                or humidity.blocks_export
+            )
+            row_needs_review = row_blocks_export
+
+            row_categories = tuple(
+                dict.fromkeys(
+                    temperature.review_categories
+                    + humidity.review_categories
+                )
+            )
+
+            row_reasons = tuple(
+                dict.fromkeys(
+                    temperature.verification_reasons
+                    + humidity.verification_reasons
+                )
+            )
+
+            row_blocking_errors = tuple(
+                dict.fromkeys(
+                    temperature.blocking_errors
+                    + humidity.blocking_errors
+                )
+            )
+            row_confirmation_reasons = tuple(
+                dict.fromkeys(
+                    (
+                        ()
+                        if temperature.human_verified
+                        else temperature.required_confirmation_reasons
+                    )
+                    + (
+                        ()
+                        if humidity.human_verified
+                        else humidity.required_confirmation_reasons
+                    )
+                )
+            )
+            row_operational_warnings = tuple(
+                dict.fromkeys(
+                    temperature.operational_warnings
+                    + humidity.operational_warnings
+                )
+            )
+            row_informational_notices = tuple(
+                dict.fromkeys(
+                    temperature.informational_notices
+                    + humidity.informational_notices
+                )
             )
 
             monitoring_rows.append(
@@ -103,6 +181,42 @@ def build_monitoring_rows(
                     "temperature": temperature.final_value,
                     "humidity": humidity.final_value,
                     "needs_review": row_needs_review,
+                    "blocks_export": row_blocks_export,
+                    "blocking_errors": row_blocking_errors,
+                    "required_confirmation_reasons": row_confirmation_reasons,
+                    "operational_warnings": row_operational_warnings,
+                    "informational_notices": row_informational_notices,
+                    "status": (
+                        "Blocked"
+                        if row_blocks_export
+                        else (
+                            "Operational warning"
+                            if row_operational_warnings
+                            else (
+                                "Ready with notice"
+                                if row_informational_notices
+                                else "Ready"
+                            )
+                        )
+                    ),
+                    "status_reason": " ".join(row_reasons),
+                    "review_categories": row_categories,
+                    "has_ocr_uncertainty": (
+                        temperature.ocr_uncertain
+                        or humidity.ocr_uncertain
+                    ),
+                    "has_operational_warning": (
+                        temperature.operational_severity
+                        in {"alert", "alarming", "critical"}
+                    ),
+                    "has_anomaly": (
+                        temperature.is_statistical_anomaly
+                        or humidity.is_statistical_anomaly
+                    ),
+                    "has_blank_mismatch": (
+                        temperature.has_blank_mismatch
+                        or humidity.has_blank_mismatch
+                    ),
 
                     "temperature_is_blank": (
                         temperature.is_blank
@@ -120,6 +234,33 @@ def build_monitoring_rows(
                     "humidity_needs_review": (
                         humidity.needs_review
                     ),
+                    "temperature_status": (
+                        "Blocked"
+                        if temperature.blocks_export
+                        else "Operational warning"
+                        if temperature.operational_warnings
+                        else "Ready with notice"
+                        if temperature.informational_notices
+                        else "Verified"
+                        if temperature.human_verified
+                        else "Ready"
+                    ),
+                    "humidity_status": (
+                        "Blocked"
+                        if humidity.blocks_export
+                        else "Operational warning"
+                        if humidity.operational_warnings
+                        else "Ready with notice"
+                        if humidity.informational_notices
+                        else "Verified"
+                        if humidity.human_verified
+                        else "Ready"
+                    ),
+                    "temperature_status_reason": temperature.review_reason,
+                    "humidity_status_reason": humidity.review_reason,
+                    "temperature_severity": temperature.operational_severity,
+                    "temperature_human_verified": temperature.human_verified,
+                    "humidity_human_verified": humidity.human_verified,
 
                     "temperature_prediction": (
                         temperature.consensus_prediction

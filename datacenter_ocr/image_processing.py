@@ -84,19 +84,6 @@ def detect_edges(
 
     return edges
 
-    kernel = np.ones(
-        (3, 3),
-        dtype=np.uint8,
-    )
-
-    connected_edges = cv2.dilate(
-        edges,
-        kernel,
-        iterations=1,
-    )
-
-    return connected_edges
-
 def connect_edges(
     edges: np.ndarray,
     kernel_size: int = 3,

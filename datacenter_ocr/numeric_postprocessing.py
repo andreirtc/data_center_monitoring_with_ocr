@@ -2,14 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import re
-
-
-TEMPERATURE_MIN = 10.0
-TEMPERATURE_MAX = 50.0
-
-HUMIDITY_MIN = 0.0
-HUMIDITY_MAX = 100.0
+from datacenter_ocr.verification import (
+    HUMIDITY_MAX,
+    HUMIDITY_MIN,
+    TEMPERATURE_MAX,
+    TEMPERATURE_MIN,
+    validate_reading_value,
+)
 
 DECIMAL_PLACES = 1
 
@@ -82,52 +81,12 @@ def validate_final_reading(
         no value and an error message.
     """
 
-    if value is None:
-        return None, None
-
-    text = (
-        str(value)
-        .strip()
-        .replace(",", ".")
-    )
-
-    # Pandas may represent empty table cells as NaN.
-    if (
-        not text
-        or text.lower() == "nan"
-    ):
-        return None, None
-
-    # The company form requires exactly one decimal digit.
-    if re.fullmatch(
-        r"-?\d+\.\d",
-        text,
-    ) is None:
-        return (
-            None,
-            "Use exactly one decimal place, "
-            "such as 22.0 or 53.3.",
-        )
-
-    normalized_value = (
-        f"{float(text):.1f}"
-    )
-
-    if not is_valid_value(
-        normalized_value,
+    validation = validate_reading_value(
+        value,
         reading_type,
-    ):
-        if reading_type == "temperature":
-            valid_range = "10.0 to 50.0"
-        else:
-            valid_range = "0.0 to 100.0"
-
-        return (
-            None,
-            f"The value must be within {valid_range}.",
-        )
-
-    return normalized_value, None
+        allow_blank=True,
+    )
+    return validation.normalized_value, validation.error
 
 def trim_extra_decimal_digits(
     text: str,
@@ -199,10 +158,13 @@ def add_candidate(
         candidate
     )
 
-    if is_valid_value(
+    validation = validate_reading_value(
         candidate,
         reading_type,
-    ):
+        allow_blank=False,
+    )
+
+    if validation.error is None:
         candidates[candidate] = reason
 
 
@@ -228,33 +190,48 @@ def correct_numeric_prediction(
             reason="OCR returned an empty value.",
         )
 
-    # First handle excessive precision.
+    # Excess precision is ambiguous. Keep it visible for a reviewer
+    # instead of silently discarding a possibly meaningful digit.
     precision_adjusted = trim_extra_decimal_digits(
         original_text
     )
 
-    if is_valid_value(
-        precision_adjusted,
-        reading_type,
-    ):
-        if precision_adjusted != original_text:
-            return CorrectionResult(
-                original_text=original_text,
-                corrected_text=precision_adjusted,
-                changed=True,
-                needs_review=False,
-                reason=(
-                    "Removed extra decimal digits because "
-                    "the form uses one decimal place."
-                ),
-            )
+    if precision_adjusted != original_text:
+        return CorrectionResult(
+            original_text=original_text,
+            corrected_text=original_text,
+            changed=False,
+            needs_review=True,
+            reason=(
+                "OCR returned extra decimal digits; no digit was "
+                "discarded automatically."
+            ),
+        )
 
+    validation = validate_reading_value(
+        original_text,
+        reading_type,
+        allow_blank=False,
+    )
+
+    if validation.error is None:
         return CorrectionResult(
             original_text=original_text,
             corrected_text=original_text,
             changed=False,
             needs_review=False,
             reason="Prediction already follows the expected format.",
+        )
+
+    # A decimal point with a missing or malformed digit cannot be
+    # repaired safely by moving or inserting another decimal point.
+    if "." in original_text:
+        return CorrectionResult(
+            original_text=original_text,
+            corrected_text=original_text,
+            changed=False,
+            needs_review=True,
+            reason=validation.error or "Malformed numeric prediction.",
         )
 
     candidates: dict[str, str] = {}
@@ -349,8 +326,11 @@ def correct_numeric_prediction(
             original_text=original_text,
             corrected_text=corrected_text,
             changed=True,
-            needs_review=False,
-            reason=reason,
+            needs_review=True,
+            reason=(
+                f"Proposed {corrected_text} after OCR repair. "
+                f"{reason} Human verification is required."
+            ),
         )
 
     if len(candidates) > 1:

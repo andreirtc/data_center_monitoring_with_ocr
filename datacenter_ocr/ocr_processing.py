@@ -4,7 +4,7 @@ from collections.abc import Callable
 import json
 import re
 from collections import Counter, defaultdict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datacenter_ocr.blank_cell_detection import analyze_cell_for_blankness
 from typing import Any
 
@@ -14,6 +14,7 @@ from paddleocr import TextRecognition
 
 from datacenter_ocr.cell_preprocessing import create_ocr_variants
 from datacenter_ocr.numeric_postprocessing import correct_numeric_prediction
+from datacenter_ocr.verification import verify_cell_results
 
 
 PRODUCTION_VARIANTS = (
@@ -50,6 +51,22 @@ class CellOCRResult:
     review_reason: str
     is_blank: bool = False
     blank_ink_ratio: float = 0.0
+    raw_predictions: dict[str, str] = field(default_factory=dict)
+    ocr_uncertainty_reasons: tuple[str, ...] = ()
+    human_verified: bool = False
+    verification_reasons: tuple[str, ...] = ()
+    review_categories: tuple[str, ...] = ()
+    blocking_errors: tuple[str, ...] = ()
+    required_confirmation_reasons: tuple[str, ...] = ()
+    operational_warnings: tuple[str, ...] = ()
+    informational_notices: tuple[str, ...] = ()
+    blocks_export: bool = False
+    format_is_valid: bool = True
+    within_absolute_limits: bool = True
+    operational_severity: str = "not applicable"
+    is_statistical_anomaly: bool = False
+    has_blank_mismatch: bool = False
+    ocr_uncertain: bool = False
 
 
 def normalize_numeric_text(
@@ -381,6 +398,11 @@ def process_measurement_cells(
                 correction.reason
             )
 
+        elif correction.changed:
+            review_reasons.append(
+                correction.reason
+            )
+
         needs_review = bool(
             review_reasons
         )
@@ -396,6 +418,11 @@ def process_measurement_cells(
 
         predictions = {
             result["variant"]: result["normalized_text"]
+            for result in variant_results
+        }
+
+        raw_predictions = {
+            result["variant"]: result["raw_text"]
             for result in variant_results
         }
 
@@ -415,6 +442,7 @@ def process_measurement_cells(
                 reading_type=cell["reading_type"],
                 predictions=predictions,
                 confidences=confidences,
+                raw_predictions=raw_predictions,
                 consensus_prediction=consensus_prediction,
                 agreement_count=agreement_count,
                 average_consensus_confidence=round(
@@ -424,10 +452,11 @@ def process_measurement_cells(
                 final_value=final_value,
                 needs_review=needs_review,
                 review_reason=review_reason,
+                ocr_uncertainty_reasons=tuple(review_reasons),
             )
         )
 
-    return final_results
+    return verify_cell_results(final_results)
 
 def process_measurement_cells_in_batches(
     model: TextRecognition,
@@ -482,7 +511,7 @@ def process_measurement_cells_in_batches(
                 total_cells,
             )
 
-    return all_results
+    return verify_cell_results(all_results)
 
 def process_measurement_cells_with_blank_detection(
     model: TextRecognition,
@@ -530,6 +559,12 @@ def process_measurement_cells_with_blank_detection(
             reading_type=cell["reading_type"],
 
             predictions={
+                "original": "",
+                "grayscale": "",
+                "contrast": "",
+            },
+
+            raw_predictions={
                 "original": "",
                 "grayscale": "",
                 "contrast": "",
@@ -635,4 +670,4 @@ def process_measurement_cells_with_blank_detection(
             "the number of extracted cells."
         )
 
-    return ordered_results
+    return verify_cell_results(ordered_results)

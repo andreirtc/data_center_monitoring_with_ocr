@@ -10,9 +10,7 @@ from typing import Any
 from datacenter_ocr.config import (
     EXCEL_TEMPLATE_PATH,
 )
-from datacenter_ocr.numeric_postprocessing import (
-    is_valid_value,
-)
+from datacenter_ocr.verification import validate_export_reading
 
 
 WORKSHEET_XML_PATH = (
@@ -241,44 +239,11 @@ def _normalize_reading(
     Blank form cells remain blank.
     """
 
-    if value is None:
-        return None
-
-    text = (
-        str(value)
-        .strip()
-        .replace(",", ".")
-    )
-
-    if not text:
-        return None
-
-    if re.fullmatch(
-        r"-?\d+(?:\.\d)?",
-        text,
-    ) is None:
-        raise ValueError(
-            f"Day {day}, Point {point}, "
-            f"{reading_type} has an invalid value: "
-            f"{value!r}. Use one decimal place."
-        )
-
-    normalized_text = (
-        f"{float(text):.1f}"
-    )
-
-    if not is_valid_value(
-        normalized_text,
-        reading_type,
-    ):
-        raise ValueError(
-            f"Day {day}, Point {point}, "
-            f"{reading_type} is outside the "
-            f"accepted range: {normalized_text}."
-        )
-
-    return float(
-        normalized_text
+    return validate_export_reading(
+        value=value,
+        reading_type=reading_type,
+        day=day,
+        point=point,
     )
 
 
@@ -299,19 +264,27 @@ def _index_monitoring_rows(
             f"but received {len(monitoring_rows)}."
         )
 
-    unresolved_rows = [
+    missing_export_state = [
         row
         for row in monitoring_rows
-        if bool(
-            row.get("needs_review")
+        if "blocks_export" not in row
+    ]
+    if missing_export_state:
+        raise ValueError(
+            "Monitoring rows are missing explicit export verification state."
         )
+
+    blocked_rows = [
+        row
+        for row in monitoring_rows
+        if bool(row["blocks_export"])
     ]
 
-    if unresolved_rows:
+    if blocked_rows:
         raise ValueError(
-            f"{len(unresolved_rows)} monitoring "
-            "row(s) still require manual review. "
-            "Complete all review items before "
+            f"{len(blocked_rows)} monitoring "
+            "row(s) contain blocking errors or unresolved confirmations. "
+            "Resolve all export-blocking items before "
             "exporting the final workbook."
         )
 
