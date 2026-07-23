@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import time
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,7 @@ from datacenter_ocr.config import (
     OUTPUT_FOLDER,
     TEST_IMAGE_PATH,
 )
+from datacenter_ocr.diagnostic_export import write_cell_results_csv
 from datacenter_ocr.image_processing import (
     load_image,
     save_image,
@@ -21,6 +23,10 @@ from datacenter_ocr.monitoring_records import (
 from datacenter_ocr.ocr_processing import (
     CellOCRResult,
     process_measurement_cells_with_blank_detection,
+)
+from datacenter_ocr.processing_metrics import (
+    ProcessingMetrics,
+    write_processing_metrics_json,
 )
 from datacenter_ocr.sheet_processing import (
     prepare_monitoring_sheet,
@@ -45,6 +51,11 @@ MONITORING_ROWS_PATH = (
 REVIEW_CELLS_FOLDER = (
     FULL_SHEET_OCR_FOLDER
     / "review_cells"
+)
+
+PROCESSING_METRICS_PATH = (
+    FULL_SHEET_OCR_FOLDER
+    / "processing_metrics.json"
 )
 
 CELLS_PER_PROCESSING_BATCH = 32
@@ -77,95 +88,7 @@ def save_cell_results(
     Save detailed OCR information for every individual cell.
     """
 
-    output_path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    fieldnames = [
-        "filename",
-        "day",
-        "point",
-        "reading_type",
-        "is_blank",
-        "blank_ink_ratio",
-
-        "original_prediction",
-        "grayscale_prediction",
-        "contrast_prediction",
-
-        "original_confidence",
-        "grayscale_confidence",
-        "contrast_confidence",
-
-        "consensus_prediction",
-        "agreement_count",
-        "average_consensus_confidence",
-
-        "final_value",
-        "needs_review",
-        "review_reason",
-    ]
-
-    with output_path.open(
-        mode="w",
-        newline="",
-        encoding="utf-8",
-    ) as csv_file:
-        writer = csv.DictWriter(
-            csv_file,
-            fieldnames=fieldnames,
-        )
-
-        writer.writeheader()
-
-        for result in results:
-            writer.writerow(
-                {
-                    "filename": result.filename,
-                    "day": result.day,
-                    "point": result.point,
-                    "reading_type": result.reading_type,
-                    "is_blank": result.is_blank,
-                    "blank_ink_ratio": (
-                        result.blank_ink_ratio
-                    ),
-
-                    "original_prediction": (
-                        result.predictions["original"]
-                    ),
-                    "grayscale_prediction": (
-                        result.predictions["grayscale"]
-                    ),
-                    "contrast_prediction": (
-                        result.predictions["contrast"]
-                    ),
-
-                    "original_confidence": (
-                        result.confidences["original"]
-                    ),
-                    "grayscale_confidence": (
-                        result.confidences["grayscale"]
-                    ),
-                    "contrast_confidence": (
-                        result.confidences["contrast"]
-                    ),
-
-                    "consensus_prediction": (
-                        result.consensus_prediction
-                    ),
-                    "agreement_count": (
-                        result.agreement_count
-                    ),
-                    "average_consensus_confidence": (
-                        result.average_consensus_confidence
-                    ),
-
-                    "final_value": result.final_value,
-                    "needs_review": result.needs_review,
-                    "review_reason": result.review_reason,
-                }
-            )
+    write_cell_results_csv(results, output_path)
 
 
 def save_monitoring_rows(
@@ -243,20 +166,36 @@ def main() -> None:
     Run production OCR on all 496 monitoring cells.
     """
 
+    metrics = ProcessingMetrics(
+        source_filename=str(TEST_IMAGE_PATH),
+        uploaded_fingerprint=hashlib.sha256(
+            TEST_IMAGE_PATH.read_bytes()
+        ).hexdigest(),
+        model_was_warm=False,
+    )
+    metrics.capture_process_uptime()
+
     print(
         "Loading monitoring-sheet image..."
     )
 
+    decoding_start = time.perf_counter()
     original_image = load_image(
         TEST_IMAGE_PATH
     )
+    metrics.upload_decoding_seconds = round(
+        time.perf_counter() - decoding_start,
+        6,
+    )
+    metrics.uploaded_height, metrics.uploaded_width = original_image.shape[:2]
 
     print(
         "Preparing and extracting the monitoring table..."
     )
 
     prepared_sheet = prepare_monitoring_sheet(
-        original_image
+        original_image,
+        metrics=metrics,
     )
 
     print(
@@ -268,8 +207,13 @@ def main() -> None:
         "Loading PaddleOCR recognition model..."
     )
 
+    model_start = time.perf_counter()
     model = TextRecognition(
         device="cpu"
+    )
+    metrics.model_construction_seconds = round(
+        time.perf_counter() - model_start,
+        6,
     )
 
     start_time = time.perf_counter()
@@ -282,6 +226,7 @@ def main() -> None:
                 CELLS_PER_PROCESSING_BATCH
             ),
             progress_callback=report_progress,
+            metrics=metrics,
         )
     )
 
@@ -290,13 +235,24 @@ def main() -> None:
         - start_time
     )
 
+    record_start = time.perf_counter()
     monitoring_rows = build_monitoring_rows(
         cell_results
     )
+    metrics.monitoring_record_construction_seconds = round(
+        time.perf_counter() - record_start,
+        6,
+    )
+    metrics.recalculate_total()
 
     save_cell_results(
         results=cell_results,
         output_path=CELL_RESULTS_PATH,
+    )
+
+    write_processing_metrics_json(
+        metrics,
+        PROCESSING_METRICS_PATH,
     )
 
     save_monitoring_rows(
@@ -408,6 +364,12 @@ def main() -> None:
     print(
         "Review-cell images:\n"
         f"{REVIEW_CELLS_FOLDER}"
+    )
+
+    print()
+    print(
+        "Stage processing metrics:\n"
+        f"{PROCESSING_METRICS_PATH}"
     )
 
 

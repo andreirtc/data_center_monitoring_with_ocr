@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 
 import numpy as np
 
@@ -32,6 +33,16 @@ from datacenter_ocr.image_processing import (
     resize_to_maximum_width,
     warp_perspective,
 )
+from datacenter_ocr.processing_metrics import ProcessingMetrics
+from datacenter_ocr.local_grid import (
+    GeometryMode,
+    LocalGridCalibration,
+    RowSequenceAlignment,
+    align_measurement_boxes_to_printed_rows,
+    calibrate_local_grid,
+    draw_calibrated_grid_overlay,
+    extract_calibrated_measurement_cells,
+)
 from datacenter_ocr.table_layout import build_measurement_boxes
 
 
@@ -46,10 +57,16 @@ class PreparedMonitoringSheet:
     measurement_grid_overlay: np.ndarray
     measurement_boxes: list[dict]
     cells: list[dict]
+    geometry_mode: GeometryMode = "fixed"
+    grid_calibration: LocalGridCalibration | None = None
+    row_sequence_alignment: RowSequenceAlignment | None = None
+    invalid_geometry_cell_count: int = 0
 
 
 def prepare_monitoring_sheet(
     original_image: np.ndarray,
+    metrics: ProcessingMetrics | None = None,
+    geometry_mode: GeometryMode = "fixed",
 ) -> PreparedMonitoringSheet:
     """
     Detect, straighten, standardize, and divide one monitoring sheet.
@@ -68,6 +85,8 @@ def prepare_monitoring_sheet(
         raise ValueError(
             "The monitoring-sheet image is empty."
         )
+
+    detection_start = time.perf_counter()
 
     # Use a smaller copy for faster table detection.
     resized_image = resize_to_maximum_width(
@@ -110,8 +129,18 @@ def prepare_monitoring_sheet(
         table_contour,
     )
 
+    if metrics is not None:
+        metrics.add_seconds(
+            "document_table_detection_seconds",
+            time.perf_counter() - detection_start,
+        )
+
+    if geometry_mode not in ("fixed", "calibrated"):
+        raise ValueError(f"Unknown geometry mode: {geometry_mode}")
+
     # Detection occurred on the resized copy. Convert the contour
     # coordinates back to the original high-resolution image.
+    warp_start = time.perf_counter()
     original_width = original_image.shape[1]
     resized_width = resized_image.shape[1]
 
@@ -132,6 +161,13 @@ def prepare_monitoring_sheet(
         output_height=STANDARD_TABLE_HEIGHT,
     )
 
+    if metrics is not None:
+        metrics.add_seconds(
+            "perspective_warp_seconds",
+            time.perf_counter() - warp_start,
+        )
+
+    extraction_start = time.perf_counter()
     warped_height, warped_width = (
         warped_table.shape[:2]
     )
@@ -140,8 +176,14 @@ def prepare_monitoring_sheet(
         image_width=warped_width,
         image_height=warped_height,
     )
+    measurement_boxes, row_sequence_alignment = (
+        align_measurement_boxes_to_printed_rows(
+            warped_table,
+            measurement_boxes,
+        )
+    )
 
-    cells = extract_measurement_cells(
+    fixed_cells = extract_measurement_cells(
         image=warped_table,
         measurement_boxes=measurement_boxes,
         horizontal_margin_ratio=(
@@ -158,12 +200,35 @@ def prepare_monitoring_sheet(
         ),
     )
 
-    measurement_grid_overlay = (
-        draw_measurement_boxes(
+    grid_calibration = None
+    invalid_geometry_cell_count = 0
+    if geometry_mode == "calibrated":
+        grid_calibration = calibrate_local_grid(
+            warped_table,
+            measurement_boxes,
+        )
+        cells, invalid_geometry_cell_count = extract_calibrated_measurement_cells(
+            image=warped_table,
+            measurement_boxes=measurement_boxes,
+            fixed_cells=fixed_cells,
+            calibration=grid_calibration,
+        )
+        measurement_grid_overlay = draw_calibrated_grid_overlay(
+            warped_table,
+            grid_calibration,
+        )
+    else:
+        cells = fixed_cells
+        measurement_grid_overlay = draw_measurement_boxes(
             image=warped_table,
             measurement_boxes=measurement_boxes,
         )
-    )
+
+    if metrics is not None:
+        metrics.add_seconds(
+            "measurement_cell_extraction_seconds",
+            time.perf_counter() - extraction_start,
+        )
 
     return PreparedMonitoringSheet(
         detection_preview=detection_preview,
@@ -173,4 +238,39 @@ def prepare_monitoring_sheet(
         ),
         measurement_boxes=measurement_boxes,
         cells=cells,
+        geometry_mode=geometry_mode,
+        grid_calibration=grid_calibration,
+        row_sequence_alignment=row_sequence_alignment,
+        invalid_geometry_cell_count=invalid_geometry_cell_count,
+    )
+
+
+def prepare_calibrated_monitoring_sheet(
+    fixed_sheet: PreparedMonitoringSheet,
+) -> PreparedMonitoringSheet:
+    """Calibrate an already warped fixed sheet without repeating table detection."""
+
+    calibration = calibrate_local_grid(
+        fixed_sheet.warped_table,
+        fixed_sheet.measurement_boxes,
+    )
+    calibrated_cells, invalid_count = extract_calibrated_measurement_cells(
+        image=fixed_sheet.warped_table,
+        measurement_boxes=fixed_sheet.measurement_boxes,
+        fixed_cells=fixed_sheet.cells,
+        calibration=calibration,
+    )
+    return PreparedMonitoringSheet(
+        detection_preview=fixed_sheet.detection_preview,
+        warped_table=fixed_sheet.warped_table,
+        measurement_grid_overlay=draw_calibrated_grid_overlay(
+            fixed_sheet.warped_table,
+            calibration,
+        ),
+        measurement_boxes=fixed_sheet.measurement_boxes,
+        cells=calibrated_cells,
+        geometry_mode="calibrated",
+        grid_calibration=calibration,
+        row_sequence_alignment=fixed_sheet.row_sequence_alignment,
+        invalid_geometry_cell_count=invalid_count,
     )

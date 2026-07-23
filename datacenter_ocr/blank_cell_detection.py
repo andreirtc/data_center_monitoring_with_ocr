@@ -6,6 +6,12 @@ import cv2
 import numpy as np
 
 
+BLANK_ANALYSIS_CANVAS_WIDTH = 112
+BLANK_ANALYSIS_CANVAS_HEIGHT = 40
+BLANK_ANALYSIS_BORDER_EXCLUSION_RATIO = 0.06
+BLANK_ANALYSIS_CANVAS_EDGE_RATIO = 0.05
+
+
 @dataclass(frozen=True)
 class BlankCellAnalysis:
     """
@@ -15,13 +21,85 @@ class BlankCellAnalysis:
     is_blank: bool
     ink_ratio: float
     significant_component_count: int
+    largest_component_ratio: float
+    analysis_width: int
+    analysis_height: int
+    used_normalized_canvas: bool
     cleaned_ink_mask: np.ndarray
+
+
+def create_blank_analysis_canvas(
+    cell_image: np.ndarray,
+    canvas_width: int = BLANK_ANALYSIS_CANVAS_WIDTH,
+    canvas_height: int = BLANK_ANALYSIS_CANVAS_HEIGHT,
+    border_exclusion_ratio: float = BLANK_ANALYSIS_BORDER_EXCLUSION_RATIO,
+) -> np.ndarray:
+    """Place a cell on a stable, aspect-preserving blank-analysis canvas.
+
+    Both fixed and perspective-warped crops are evaluated at the same size.
+    A proportional perimeter is excluded before resizing, and the same canvas
+    edge is cleared afterward. ``INTER_AREA`` is used consistently for every
+    crop so geometry-specific source dimensions do not change the denominator
+    or connected-component scale.
+    """
+
+    if cell_image is None or cell_image.size == 0:
+        raise ValueError("Cannot normalize an empty cell image.")
+    if canvas_width <= 0 or canvas_height <= 0:
+        raise ValueError("Blank-analysis canvas dimensions must be positive.")
+    if not 0.0 <= border_exclusion_ratio < 0.5:
+        raise ValueError("border_exclusion_ratio must be between 0.0 and 0.5.")
+
+    source_height, source_width = cell_image.shape[:2]
+    excluded_x = round(source_width * border_exclusion_ratio)
+    excluded_y = round(source_height * border_exclusion_ratio)
+    x1 = excluded_x
+    x2 = source_width - excluded_x
+    y1 = excluded_y
+    y2 = source_height - excluded_y
+    if x1 >= x2 or y1 >= y2:
+        raise ValueError("Blank-analysis border exclusion removed the whole crop.")
+
+    inner_image = cell_image[y1:y2, x1:x2]
+    inner_height, inner_width = inner_image.shape[:2]
+    scale = min(canvas_width / inner_width, canvas_height / inner_height)
+    resized_width = max(1, round(inner_width * scale))
+    resized_height = max(1, round(inner_height * scale))
+    resized_image = cv2.resize(
+        inner_image,
+        (resized_width, resized_height),
+        interpolation=cv2.INTER_AREA,
+    )
+
+    canvas_shape = (
+        (canvas_height, canvas_width)
+        if len(cell_image.shape) == 2
+        else (canvas_height, canvas_width, cell_image.shape[2])
+    )
+    canvas = np.full(canvas_shape, 255, dtype=cell_image.dtype)
+    x_offset = (canvas_width - resized_width) // 2
+    y_offset = (canvas_height - resized_height) // 2
+    canvas[
+        y_offset : y_offset + resized_height,
+        x_offset : x_offset + resized_width,
+    ] = resized_image
+
+    canvas_edge = max(
+        1,
+        round(min(canvas_width, canvas_height) * BLANK_ANALYSIS_CANVAS_EDGE_RATIO),
+    )
+    canvas[:canvas_edge] = 255
+    canvas[-canvas_edge:] = 255
+    canvas[:, :canvas_edge] = 255
+    canvas[:, -canvas_edge:] = 255
+    return canvas
 
 
 def analyze_cell_for_blankness(
     cell_image: np.ndarray,
     ink_ratio_threshold: float = 0.003,
     minimum_component_area: int = 6,
+    normalize_analysis_canvas: bool = True,
 ) -> BlankCellAnalysis:
     """
     Estimate whether a cell contains meaningful handwriting.
@@ -35,11 +113,17 @@ def analyze_cell_for_blankness(
             "Cannot analyze an empty cell image."
         )
 
-    if len(cell_image.shape) == 2:
-        grayscale_image = cell_image.copy()
+    analysis_image = (
+        create_blank_analysis_canvas(cell_image)
+        if normalize_analysis_canvas
+        else cell_image.copy()
+    )
+
+    if len(analysis_image.shape) == 2:
+        grayscale_image = analysis_image.copy()
     else:
         grayscale_image = cv2.cvtColor(
-            cell_image,
+            analysis_image,
             cv2.COLOR_BGR2GRAY,
         )
 
@@ -126,6 +210,7 @@ def analyze_cell_for_blankness(
     )
 
     significant_component_count = 0
+    largest_component_area = 0
 
     # Component zero is the background, so iteration starts at one.
     for component_index in range(
@@ -145,6 +230,10 @@ def analyze_cell_for_blankness(
         ] = 255
 
         significant_component_count += 1
+        largest_component_area = max(
+            largest_component_area,
+            int(component_area),
+        )
 
     significant_ink_pixels = cv2.countNonZero(
         cleaned_ink_mask
@@ -156,6 +245,7 @@ def analyze_cell_for_blankness(
         significant_ink_pixels
         / total_pixels
     )
+    largest_component_ratio = largest_component_area / total_pixels
 
     is_blank = (
         ink_ratio < ink_ratio_threshold
@@ -167,5 +257,9 @@ def analyze_cell_for_blankness(
         significant_component_count=(
             significant_component_count
         ),
+        largest_component_ratio=largest_component_ratio,
+        analysis_width=width,
+        analysis_height=height,
+        used_normalized_canvas=normalize_analysis_canvas,
         cleaned_ink_mask=cleaned_ink_mask,
     )

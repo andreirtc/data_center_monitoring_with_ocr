@@ -2,7 +2,9 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import json
+import math
 import re
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field, replace
 from datacenter_ocr.blank_cell_detection import analyze_cell_for_blankness
@@ -14,6 +16,7 @@ from paddleocr import TextRecognition
 
 from datacenter_ocr.cell_preprocessing import create_ocr_variants
 from datacenter_ocr.numeric_postprocessing import correct_numeric_prediction
+from datacenter_ocr.processing_metrics import ProcessingMetrics
 from datacenter_ocr.verification import verify_cell_results
 
 
@@ -67,6 +70,8 @@ class CellOCRResult:
     is_statistical_anomaly: bool = False
     has_blank_mismatch: bool = False
     ocr_uncertain: bool = False
+    postprocessing_status: str = "not_recorded"
+    candidate_interpretations: tuple[str, ...] = ()
 
 
 def normalize_numeric_text(
@@ -199,17 +204,37 @@ def extract_result_payload(
 def recognize_prepared_images(
     model: TextRecognition,
     images: list[np.ndarray],
+    metrics: ProcessingMetrics | None = None,
 ) -> list[dict[str, Any]]:
     """
     Run text recognition on a batch of prepared images.
     """
 
+    prediction_start = time.perf_counter()
     prediction_results = list(
         model.predict(
             input=images,
             batch_size=OCR_BATCH_SIZE,
         )
     )
+    prediction_elapsed = time.perf_counter() - prediction_start
+
+    if metrics is not None:
+        metrics.add_seconds("ocr_prediction_seconds", prediction_elapsed)
+        metrics.ocr_input_image_count += len(images)
+        metrics.model_predict_call_count += 1
+        metrics.requested_batch_size = OCR_BATCH_SIZE
+        metrics.result_batch_count += math.ceil(
+            len(images) / OCR_BATCH_SIZE
+        )
+        if (
+            metrics.model_was_warm is False
+            and metrics.first_prediction_warmup_seconds is None
+        ):
+            metrics.first_prediction_warmup_seconds = round(
+                prediction_elapsed,
+                6,
+            )
 
     if len(prediction_results) != len(images):
         raise RuntimeError(
@@ -315,11 +340,13 @@ def choose_consensus(
 def process_measurement_cells(
     model: TextRecognition,
     cells: list[dict[str, Any]],
+    metrics: ProcessingMetrics | None = None,
 ) -> list[CellOCRResult]:
     """
     Recognize all supplied cells and return structured results.
     """
 
+    preprocessing_start = time.perf_counter()
     jobs = []
 
     for cell in cells:
@@ -343,6 +370,12 @@ def process_measurement_cells(
                 }
             )
 
+    if metrics is not None:
+        metrics.add_seconds(
+            "ocr_preprocessing_seconds",
+            time.perf_counter() - preprocessing_start,
+        )
+
     prepared_images = [
         job["image"]
         for job in jobs
@@ -351,8 +384,10 @@ def process_measurement_cells(
     recognized_results = recognize_prepared_images(
         model=model,
         images=prepared_images,
+        metrics=metrics,
     )
 
+    postprocessing_start = time.perf_counter()
     grouped_jobs = defaultdict(list)
 
     for job, recognized_result in zip(
@@ -453,16 +488,34 @@ def process_measurement_cells(
                 needs_review=needs_review,
                 review_reason=review_reason,
                 ocr_uncertainty_reasons=tuple(review_reasons),
+                postprocessing_status=correction.status,
+                candidate_interpretations=(
+                    correction.candidate_interpretations
+                ),
             )
         )
 
-    return verify_cell_results(final_results)
+    if metrics is not None:
+        metrics.add_seconds(
+            "postprocessing_seconds",
+            time.perf_counter() - postprocessing_start,
+        )
+
+    verification_start = time.perf_counter()
+    verified_results = verify_cell_results(final_results)
+    if metrics is not None:
+        metrics.add_seconds(
+            "verification_seconds",
+            time.perf_counter() - verification_start,
+        )
+    return verified_results
 
 def process_measurement_cells_in_batches(
     model: TextRecognition,
     cells: list[dict[str, Any]],
     cells_per_batch: int = 32,
     progress_callback: Callable[[int, int], None] | None = None,
+    metrics: ProcessingMetrics | None = None,
 ) -> list[CellOCRResult]:
     """
     Process a large collection of cells in smaller batches.
@@ -497,6 +550,7 @@ def process_measurement_cells_in_batches(
         batch_results = process_measurement_cells(
             model=model,
             cells=cell_batch,
+            metrics=metrics,
         )
 
         all_results.extend(
@@ -511,13 +565,21 @@ def process_measurement_cells_in_batches(
                 total_cells,
             )
 
-    return verify_cell_results(all_results)
+    verification_start = time.perf_counter()
+    verified_results = verify_cell_results(all_results)
+    if metrics is not None:
+        metrics.add_seconds(
+            "verification_seconds",
+            time.perf_counter() - verification_start,
+        )
+    return verified_results
 
 def process_measurement_cells_with_blank_detection(
     model: TextRecognition,
     cells: list[dict[str, Any]],
     cells_per_batch: int = 32,
     progress_callback: Callable[[int, int], None] | None = None,
+    metrics: ProcessingMetrics | None = None,
 ) -> list[CellOCRResult]:
     """
     Classify blank cells before OCR.
@@ -528,6 +590,10 @@ def process_measurement_cells_with_blank_detection(
     """
 
     if not cells:
+        if metrics is not None:
+            metrics.total_cell_count = 0
+            metrics.filled_cell_count = 0
+            metrics.blank_cell_count = 0
         return []
 
     total_cells = len(cells)
@@ -535,6 +601,8 @@ def process_measurement_cells_with_blank_detection(
     filled_cells = []
     blank_results: dict[str, CellOCRResult] = {}
     ink_ratios: dict[str, float] = {}
+
+    blank_detection_start = time.perf_counter()
 
     for cell in cells:
         blank_analysis = analyze_cell_for_blankness(
@@ -586,9 +654,19 @@ def process_measurement_cells_with_blank_detection(
 
             is_blank=True,
             blank_ink_ratio=ink_ratios[filename],
+            postprocessing_status="skipped_blank",
         )
 
     blank_count = len(blank_results)
+
+    if metrics is not None:
+        metrics.add_seconds(
+            "blank_detection_seconds",
+            time.perf_counter() - blank_detection_start,
+        )
+        metrics.total_cell_count = total_cells
+        metrics.blank_cell_count = blank_count
+        metrics.filled_cell_count = len(filled_cells)
 
     print(
         f"Blank-cell detector skipped "
@@ -629,6 +707,7 @@ def process_measurement_cells_with_blank_detection(
             cells=filled_cells,
             cells_per_batch=cells_per_batch,
             progress_callback=report_filled_progress,
+            metrics=metrics,
         )
     )
 
@@ -670,4 +749,11 @@ def process_measurement_cells_with_blank_detection(
             "the number of extracted cells."
         )
 
-    return verify_cell_results(ordered_results)
+    verification_start = time.perf_counter()
+    verified_results = verify_cell_results(ordered_results)
+    if metrics is not None:
+        metrics.add_seconds(
+            "verification_seconds",
+            time.perf_counter() - verification_start,
+        )
+    return verified_results

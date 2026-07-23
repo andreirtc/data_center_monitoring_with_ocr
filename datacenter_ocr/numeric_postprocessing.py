@@ -24,6 +24,8 @@ class CorrectionResult:
     changed: bool
     needs_review: bool
     reason: str
+    status: str = "unknown"
+    candidate_interpretations: tuple[str, ...] = ()
 
 
 def infer_reading_type(filename: str) -> str:
@@ -188,6 +190,7 @@ def correct_numeric_prediction(
             changed=False,
             needs_review=True,
             reason="OCR returned an empty value.",
+            status="empty_prediction",
         )
 
     # Excess precision is ambiguous. Keep it visible for a reviewer
@@ -206,6 +209,8 @@ def correct_numeric_prediction(
                 "OCR returned extra decimal digits; no digit was "
                 "discarded automatically."
             ),
+            status="extra_decimal_digits",
+            candidate_interpretations=(precision_adjusted,),
         )
 
     validation = validate_reading_value(
@@ -221,6 +226,8 @@ def correct_numeric_prediction(
             changed=False,
             needs_review=False,
             reason="Prediction already follows the expected format.",
+            status="valid_unchanged",
+            candidate_interpretations=(original_text,),
         )
 
     # A decimal point with a missing or malformed digit cannot be
@@ -232,6 +239,7 @@ def correct_numeric_prediction(
             changed=False,
             needs_review=True,
             reason=validation.error or "Malformed numeric prediction.",
+            status="malformed_with_decimal",
         )
 
     candidates: dict[str, str] = {}
@@ -331,6 +339,8 @@ def correct_numeric_prediction(
                 f"Proposed {corrected_text} after OCR repair. "
                 f"{reason} Human verification is required."
             ),
+            status="proposed_correction",
+            candidate_interpretations=(corrected_text,),
         )
 
     if len(candidates) > 1:
@@ -347,6 +357,8 @@ def correct_numeric_prediction(
                 "Multiple valid interpretations exist: "
                 f"{candidate_text}"
             ),
+            status="multiple_interpretations",
+            candidate_interpretations=tuple(sorted(candidates)),
         )
 
     return CorrectionResult(
@@ -358,4 +370,5 @@ def correct_numeric_prediction(
             "No safe correction produced a valid "
             f"{reading_type} value."
         ),
+        status="no_safe_correction",
     )

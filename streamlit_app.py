@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import time
 from collections import Counter
+from dataclasses import dataclass, replace
 from typing import Any
 
 import cv2
@@ -13,6 +15,23 @@ from paddleocr import TextRecognition
 import streamlit as st
 
 from datacenter_ocr.excel_export import create_monitoring_workbook
+from datacenter_ocr.day_verification import (
+    DayVerificationState,
+    apply_day_submission,
+    build_verification_audit,
+    cell_display_status,
+    invalidate_days_for_changes,
+    previous_day,
+    results_for_day,
+    state_for_sheet,
+    summarize_export_readiness,
+)
+from datacenter_ocr.extraction_preflight import (
+    build_alignment_preflight_summary,
+    geometry_warning_for_filename,
+    representative_crop_pairs,
+)
+from datacenter_ocr.grid_diagnostics import calculate_alignment_report
 from datacenter_ocr.monitoring_records import (
     attach_crop_data_urls,
     build_monitoring_rows,
@@ -21,14 +40,15 @@ from datacenter_ocr.ocr_processing import (
     CellOCRResult,
     process_measurement_cells_with_blank_detection,
 )
+from datacenter_ocr.processing_metrics import ProcessingMetrics
 from datacenter_ocr.review_workflow import (
     apply_monitoring_table_edits,
-    apply_quick_review_controls,
     apply_review_actions,
     clamp_review_state,
 )
 from datacenter_ocr.sheet_processing import (
     PreparedMonitoringSheet,
+    prepare_calibrated_monitoring_sheet,
     prepare_monitoring_sheet,
 )
 
@@ -51,12 +71,29 @@ st.set_page_config(
 )
 
 
+@dataclass
+class OCRModelResource:
+    """Cached model plus observational cold/warm timing state."""
+
+    model: TextRecognition
+    construction_seconds: float
+    prediction_call_count: int = 0
+
+
 @st.cache_resource
-def load_ocr_model() -> TextRecognition:
+def load_ocr_model() -> OCRModelResource:
     """Load PaddleOCR once and reuse it across Streamlit reruns."""
 
     print("[OCR MODEL] Loading PaddleOCR model into memory...")
-    return TextRecognition(device="cpu")
+    construction_start = time.perf_counter()
+    model = TextRecognition(device="cpu")
+    return OCRModelResource(
+        model=model,
+        construction_seconds=round(
+            time.perf_counter() - construction_start,
+            6,
+        ),
+    )
 
 
 def decode_uploaded_image(uploaded_bytes: bytes) -> np.ndarray:
@@ -87,11 +124,21 @@ def clear_previous_results() -> None:
     """Clear canonical results when the user uploads a different image."""
 
     for key in (
+        "fixed_preflight_sheet",
+        "calibrated_preflight_sheet",
+        "alignment_report",
+        "alignment_preflight_summary",
+        "preflight_processing_metrics",
         "prepared_sheet",
         "cell_results",
         "monitoring_rows",
         "processing_seconds",
+        "processing_metrics",
         "processed_fingerprint",
+        "processed_geometry_mode",
+        "day_verification_state",
+        "day_editor_version",
+        "day_flash",
         "table_editor_version",
         "cell_crop_data_urls",
         "review_flash",
@@ -182,15 +229,31 @@ def create_editable_monitoring_dataframe(
 def store_verified_results(
     results: list[CellOCRResult],
     uploaded_fingerprint: str,
+    *,
+    changed_filenames: tuple[str, ...] = (),
+    day_state: DayVerificationState | None = None,
 ) -> None:
     """Store the canonical result graph after a user update."""
 
+    current_state = state_for_sheet(
+        uploaded_fingerprint,
+        day_state or st.session_state.get("day_verification_state"),
+    )
+    if day_state is None and changed_filenames:
+        current_state = invalidate_days_for_changes(
+            current_state,
+            results,
+            changed_filenames,
+        )
     st.session_state["cell_results"] = results
     st.session_state["monitoring_rows"] = build_monitoring_rows(results)
+    st.session_state["day_verification_state"] = current_state
+    st.session_state["day_editor_version"] = (
+        st.session_state.get("day_editor_version", 0) + 1
+    )
     st.session_state["table_editor_version"] = (
         st.session_state.get("table_editor_version", 0) + 1
     )
-    st.session_state.pop(f"export_confirmed_{uploaded_fingerprint}", None)
 
 
 def review_action_key(uploaded_fingerprint: str, filename: str) -> str:
@@ -199,68 +262,6 @@ def review_action_key(uploaded_fingerprint: str, filename: str) -> str:
 
 def review_correction_key(uploaded_fingerprint: str, filename: str) -> str:
     return f"review_correction_{uploaded_fingerprint}_{filename}"
-
-
-def quick_review_confirm_key(uploaded_fingerprint: str, filename: str) -> str:
-    return f"quick_review_confirm_{uploaded_fingerprint}_{filename}"
-
-
-def quick_review_blank_key(uploaded_fingerprint: str, filename: str) -> str:
-    return f"quick_review_blank_{uploaded_fingerprint}_{filename}"
-
-
-def save_quick_review_callback(
-    uploaded_fingerprint: str,
-    filenames: list[str],
-) -> None:
-    """Apply explicit quick-review controls before the normal form rerun."""
-
-    controls = {
-        filename: {
-            "corrected_value": st.session_state.get(
-                review_correction_key(uploaded_fingerprint, filename), ""
-            ),
-            "confirm_current": st.session_state.get(
-                quick_review_confirm_key(uploaded_fingerprint, filename), False
-            ),
-            "mark_blank": st.session_state.get(
-                quick_review_blank_key(uploaded_fingerprint, filename), False
-            ),
-        }
-        for filename in filenames
-    }
-    outcome = apply_quick_review_controls(
-        results=st.session_state["cell_results"],
-        controls=controls,
-    )
-    if outcome.changed_count:
-        store_verified_results(outcome.results, uploaded_fingerprint)
-        for filename in outcome.changed_filenames:
-            for key in (
-                review_correction_key(uploaded_fingerprint, filename),
-                quick_review_confirm_key(uploaded_fingerprint, filename),
-                quick_review_blank_key(uploaded_fingerprint, filename),
-            ):
-                st.session_state.pop(key, None)
-
-    remaining = sum(result.blocks_export for result in outcome.results)
-    if outcome.errors:
-        level = "warning" if outcome.changed_count else "error"
-    elif outcome.changed_count:
-        level = "success"
-    else:
-        level = "info"
-    message = (
-        f"Saved {outcome.changed_count} review item(s). "
-        f"{remaining} export-blocking item(s) remain."
-        if outcome.changed_count or outcome.errors
-        else "No explicit review actions were selected."
-    )
-    st.session_state["review_flash"] = {
-        "level": level,
-        "message": message,
-        "errors": outcome.errors,
-    }
 
 
 def save_review_batch_callback(
@@ -298,7 +299,11 @@ def save_review_batch_callback(
         actions=actions,
     )
     if outcome.changed_count:
-        store_verified_results(outcome.results, uploaded_fingerprint)
+        store_verified_results(
+            outcome.results,
+            uploaded_fingerprint,
+            changed_filenames=outcome.changed_filenames,
+        )
         for filename in outcome.changed_filenames:
             st.session_state.pop(
                 review_action_key(uploaded_fingerprint, filename), None
@@ -343,7 +348,11 @@ def save_monitoring_table_callback(
         edited_rows=edited_rows,
     )
     if outcome.changed_count:
-        store_verified_results(outcome.results, uploaded_fingerprint)
+        store_verified_results(
+            outcome.results,
+            uploaded_fingerprint,
+            changed_filenames=outcome.changed_filenames,
+        )
     else:
         st.session_state["table_editor_version"] = (
             st.session_state.get("table_editor_version", 0) + 1
@@ -373,11 +382,115 @@ def save_monitoring_table_callback(
     }
 
 
-st.title("Data Center Monthly Monitoring OCR")
+def day_value_key(
+    uploaded_fingerprint: str,
+    day: int,
+    filename: str,
+    editor_version: int,
+) -> str:
+    return (
+        f"day_value_{uploaded_fingerprint}_{day}_{filename}_{editor_version}"
+    )
+
+
+def day_blank_key(
+    uploaded_fingerprint: str,
+    day: int,
+    filename: str,
+    editor_version: int,
+) -> str:
+    return (
+        f"day_blank_{uploaded_fingerprint}_{day}_{filename}_{editor_version}"
+    )
+
+
+def submit_day_callback(
+    uploaded_fingerprint: str,
+    day: int,
+    editor_version: int,
+    confirm_day: bool,
+    advance_after_confirmation: bool,
+) -> None:
+    """Save one day before the form's single normal Streamlit rerun."""
+
+    current_results = st.session_state["cell_results"]
+    controls = {
+        result.filename: {
+            "value": st.session_state.get(
+                day_value_key(
+                    uploaded_fingerprint,
+                    day,
+                    result.filename,
+                    editor_version,
+                ),
+                result.final_value,
+            ),
+            "is_blank": st.session_state.get(
+                day_blank_key(
+                    uploaded_fingerprint,
+                    day,
+                    result.filename,
+                    editor_version,
+                ),
+                result.is_blank,
+            ),
+        }
+        for result in results_for_day(current_results, day)
+    }
+    outcome = apply_day_submission(
+        current_results,
+        state_for_sheet(
+            uploaded_fingerprint,
+            st.session_state.get("day_verification_state"),
+        ),
+        day,
+        controls,
+        confirm_day=confirm_day,
+        advance_after_confirmation=advance_after_confirmation,
+    )
+    store_verified_results(
+        outcome.results,
+        uploaded_fingerprint,
+        day_state=outcome.state,
+    )
+    st.session_state[f"selected_day_{uploaded_fingerprint}"] = outcome.next_day
+
+    if outcome.errors:
+        level = "warning" if outcome.changed_filenames else "error"
+        message = (
+            f"Saved {len(outcome.changed_filenames)} valid reading change(s), "
+            f"but Day {day} was not confirmed."
+        )
+    elif outcome.day_confirmed:
+        level = "success"
+        message = f"Day {day} was saved and explicitly confirmed."
+    elif outcome.changed_filenames:
+        level = "success"
+        message = (
+            f"Saved {len(outcome.changed_filenames)} reading change(s) for Day "
+            f"{day}. The day still requires confirmation."
+        )
+    else:
+        level = "info"
+        message = f"No Day {day} values changed. The day remains unconfirmed."
+    st.session_state["day_flash"] = {
+        "level": level,
+        "message": message,
+        "errors": outcome.errors,
+    }
+
+
+def previous_day_callback(uploaded_fingerprint: str) -> None:
+    """Navigate without touching OCR results or confirmation state."""
+
+    key = f"selected_day_{uploaded_fingerprint}"
+    st.session_state[key] = previous_day(int(st.session_state.get(key, 1)))
+
+
+st.title("OCR-assisted monitoring sheet encoding")
 st.write(
-    "Upload a photo or scanned monthly monitoring sheet. The application "
-    "straightens the form, extracts 496 readings, and queues every value "
-    "that needs human verification."
+    "OCR prefills the company monitoring sheet. Verify each day beside the "
+    "exact extracted handwriting crops before exporting the workbook."
 )
 
 uploaded_file = st.file_uploader(
@@ -401,38 +514,231 @@ if st.session_state.get("uploaded_fingerprint") != uploaded_fingerprint:
     st.session_state["uploaded_fingerprint"] = uploaded_fingerprint
 
 try:
+    decoding_start = time.perf_counter()
     uploaded_image = decode_uploaded_image(uploaded_bytes)
+    upload_decoding_seconds = time.perf_counter() - decoding_start
 except ValueError as error:
     st.error(str(error))
     st.stop()
 
-st.subheader("Uploaded image")
-st.image(
-    convert_bgr_to_rgb(uploaded_image),
-    caption=uploaded_file.name,
-    width="stretch",
+with st.expander("Uploaded image", expanded=False):
+    st.image(
+        convert_bgr_to_rgb(uploaded_image),
+        caption=uploaded_file.name,
+        width="stretch",
+    )
+
+st.header("1. Extraction preflight")
+st.write(
+    "Prepare both extraction previews first. This geometry-only step does not "
+    "load the OCR model."
 )
 
-if st.button("Process monitoring sheet", type="primary"):
-    if st.session_state.get("processed_fingerprint") == uploaded_fingerprint:
-        st.info(
-            "This uploaded image has already been processed. The existing "
-            "results are shown below."
+fixed_preflight_sheet: PreparedMonitoringSheet | None = st.session_state.get(
+    "fixed_preflight_sheet"
+)
+calibrated_preflight_sheet: PreparedMonitoringSheet | None = (
+    st.session_state.get("calibrated_preflight_sheet")
+)
+if fixed_preflight_sheet is None or calibrated_preflight_sheet is None:
+    if st.button(
+        "Prepare extraction preview",
+        type="primary",
+        icon=":material/grid_view:",
+    ):
+        image_height, image_width = uploaded_image.shape[:2]
+        preflight_metrics = ProcessingMetrics(
+            source_filename=uploaded_file.name,
+            uploaded_fingerprint=uploaded_fingerprint,
+            extraction_geometry_mode="fixed",
+            uploaded_width=image_width,
+            uploaded_height=image_height,
+            upload_decoding_seconds=round(upload_decoding_seconds, 6),
         )
+        preflight_metrics.capture_process_uptime()
+        try:
+            with st.spinner("Preparing fixed and locally calibrated previews..."):
+                fixed_preflight_sheet = prepare_monitoring_sheet(
+                    uploaded_image,
+                    metrics=preflight_metrics,
+                    geometry_mode="fixed",
+                )
+                calibration_start = time.perf_counter()
+                calibrated_preflight_sheet = prepare_calibrated_monitoring_sheet(
+                    fixed_preflight_sheet
+                )
+                preflight_metrics.add_seconds(
+                    "measurement_cell_extraction_seconds",
+                    time.perf_counter() - calibration_start,
+                )
+                alignment_report = calculate_alignment_report(
+                    fixed_preflight_sheet
+                )
+                alignment_summary = build_alignment_preflight_summary(
+                    fixed_preflight_sheet,
+                    calibrated_preflight_sheet,
+                    alignment_report,
+                )
+            st.session_state["fixed_preflight_sheet"] = fixed_preflight_sheet
+            st.session_state["calibrated_preflight_sheet"] = (
+                calibrated_preflight_sheet
+            )
+            st.session_state["alignment_report"] = alignment_report
+            st.session_state["alignment_preflight_summary"] = alignment_summary
+            st.session_state["preflight_processing_metrics"] = preflight_metrics
+        except ValueError as error:
+            st.error(str(error))
+        except Exception as error:
+            st.error("The extraction preview could not be prepared.")
+            with st.expander("Technical error details"):
+                st.exception(error)
+
+if fixed_preflight_sheet is not None and calibrated_preflight_sheet is not None:
+    alignment_report = st.session_state.get("alignment_report")
+    if alignment_report is not None:
+        # Refresh derived UI data after a hot reload so sessions created by an
+        # older summary schema do not retain missing keys.
+        alignment_summary = build_alignment_preflight_summary(
+            fixed_preflight_sheet,
+            calibrated_preflight_sheet,
+            alignment_report,
+        )
+        st.session_state["alignment_preflight_summary"] = alignment_summary
     else:
+        alignment_summary = st.session_state.get(
+            "alignment_preflight_summary",
+            {},
+        )
+    st.caption(
+        "Both previews use the same detected Day 1-31 row span when the "
+        "printed-line evidence is strong. Fixed keeps straight, evenly spaced "
+        "rows; local calibration follows small line bends and column drift."
+    )
+    overlay_columns = st.columns(2)
+    with overlay_columns[0]:
+        st.subheader("Fixed-grid overlay")
+        st.image(
+            convert_bgr_to_rgb(fixed_preflight_sheet.measurement_grid_overlay),
+            width="stretch",
+        )
+    with overlay_columns[1]:
+        st.subheader("Locally calibrated-grid overlay")
+        st.image(
+            convert_bgr_to_rgb(
+                calibrated_preflight_sheet.measurement_grid_overlay
+            ),
+            width="stretch",
+        )
+
+    alignment_metrics = st.columns(4)
+    alignment_metrics[0].metric(
+        "Alignment score",
+        alignment_summary["provisional_alignment_score"],
+        help="Diagnostic and uncalibrated; inspect the overlays and crops.",
+    )
+    alignment_metrics[1].metric(
+        "Horizontal lines",
+        f"{alignment_summary['matched_horizontal_lines']}/"
+        f"{alignment_summary['expected_horizontal_lines']}",
+    )
+    alignment_metrics[2].metric(
+        "Vertical lines",
+        f"{alignment_summary['matched_vertical_lines']}/"
+        f"{alignment_summary['expected_vertical_lines']}",
+    )
+    alignment_metrics[3].metric(
+        "Fallback boundaries",
+        alignment_summary["fallback_boundary_count"],
+    )
+    for warning in alignment_summary.get("warnings", ()):
+        st.warning(warning)
+    for notice in alignment_summary.get("notices", ()):
+        st.info(notice)
+    st.caption(alignment_summary.get("notice", ""))
+
+    st.subheader("Representative top, middle, and bottom crops")
+    st.caption(
+        "Fixed and calibrated crops use the same stable filename. Compare "
+        "handwriting placement and neighboring border contamination."
+    )
+    for crop_pair in representative_crop_pairs(
+        fixed_preflight_sheet,
+        calibrated_preflight_sheet,
+    ):
+        label_column, fixed_column, calibrated_column = st.columns([1, 2, 2])
+        label_column.markdown(
+            f"**{crop_pair['position']}**  \nDay {crop_pair['day']}, Point 4, "
+            f"{crop_pair['reading_type'].title()}"
+        )
+        fixed_column.image(
+            convert_bgr_to_rgb(crop_pair["fixed_image"]),
+            caption=f"Fixed · {crop_pair['filename']}",
+            width="stretch",
+        )
+        calibrated_column.image(
+            convert_bgr_to_rgb(crop_pair["calibrated_image"]),
+            caption=f"Calibrated · {crop_pair['filename']}",
+            width="stretch",
+        )
+
+    geometry_choice = st.segmented_control(
+        "Extraction geometry",
+        options=["fixed", "calibrated"],
+        default="fixed",
+        required=True,
+        format_func=lambda mode: (
+            "Fixed extraction" if mode == "fixed" else "Locally calibrated extraction"
+        ),
+        key=f"geometry_choice_{uploaded_fingerprint}",
+        persist_state="session",
+    )
+    st.caption(
+        "Fixed is the conservative initial default. The choice is based only "
+        "on the extraction preview and alignment evidence—not OCR values."
+    )
+
+    current_result_matches_choice = (
+        st.session_state.get("processed_fingerprint") == uploaded_fingerprint
+        and st.session_state.get("processed_geometry_mode") == geometry_choice
+    )
+    run_ocr = st.button(
+        f"Run OCR with {geometry_choice} extraction",
+        type="primary",
+        icon=":material/document_scanner:",
+        disabled=current_result_matches_choice,
+    )
+    if current_result_matches_choice:
+        st.info(
+            f"The current results already use {geometry_choice} extraction. "
+            "Preview navigation and geometry selection do not rerun OCR."
+        )
+
+    if run_ocr:
+        selected_sheet = (
+            fixed_preflight_sheet
+            if geometry_choice == "fixed"
+            else calibrated_preflight_sheet
+        )
+        processing_metrics = replace(
+            st.session_state["preflight_processing_metrics"],
+            extraction_geometry_mode=geometry_choice,
+        )
         progress_bar = st.progress(0)
         progress_message = st.empty()
         try:
-            progress_message.write("Detecting and straightening the table...")
-            prepared_sheet = prepare_monitoring_sheet(uploaded_image)
-            st.session_state["prepared_sheet"] = prepared_sheet
-
             progress_message.write("Loading the OCR recognition model...")
-            ocr_model = load_ocr_model()
-            processing_start = time.perf_counter()
+            ocr_resource = load_ocr_model()
+            processing_metrics.model_was_warm = (
+                ocr_resource.prediction_call_count > 0
+            )
+            processing_metrics.model_construction_seconds = (
+                0.0
+                if processing_metrics.model_was_warm
+                else ocr_resource.construction_seconds
+            )
 
             def update_progress(processed_count: int, total_count: int) -> None:
-                """Report whole-sheet OCR progress."""
+                """Report whole-sheet OCR progress after explicit submission."""
 
                 percentage = int(processed_count / total_count * 100)
                 progress_bar.progress(min(percentage, 100))
@@ -440,30 +746,47 @@ if st.button("Process monitoring sheet", type="primary"):
                     f"Processing cells: {processed_count}/{total_count}"
                 )
 
-            cell_results = process_measurement_cells_with_blank_detection(
-                model=ocr_model,
-                cells=prepared_sheet.cells,
+            processed_results = process_measurement_cells_with_blank_detection(
+                model=ocr_resource.model,
+                cells=selected_sheet.cells,
                 cells_per_batch=CELLS_PER_PROCESSING_BATCH,
                 progress_callback=update_progress,
+                metrics=processing_metrics,
             )
-            monitoring_rows = build_monitoring_rows(cell_results)
-            st.session_state["cell_results"] = cell_results
-            st.session_state["monitoring_rows"] = monitoring_rows
+            ocr_resource.prediction_call_count += (
+                processing_metrics.model_predict_call_count
+            )
+            record_start = time.perf_counter()
+            processed_rows = build_monitoring_rows(processed_results)
+            processing_metrics.monitoring_record_construction_seconds = round(
+                time.perf_counter() - record_start,
+                6,
+            )
+            processing_metrics.recalculate_total()
+            st.session_state["prepared_sheet"] = selected_sheet
+            st.session_state["cell_results"] = processed_results
+            st.session_state["monitoring_rows"] = processed_rows
+            st.session_state["processing_metrics"] = processing_metrics
             st.session_state["processing_seconds"] = (
-                time.perf_counter() - processing_start
+                processing_metrics.total_sheet_processing_seconds
             )
             st.session_state["processed_fingerprint"] = uploaded_fingerprint
+            st.session_state["processed_geometry_mode"] = geometry_choice
+            st.session_state["day_verification_state"] = DayVerificationState(
+                sheet_fingerprint=uploaded_fingerprint
+            )
+            st.session_state[f"selected_day_{uploaded_fingerprint}"] = 1
+            st.session_state["day_editor_version"] = 0
             st.session_state["table_editor_version"] = 0
+            st.session_state.pop("cell_crop_data_urls", None)
             progress_bar.progress(100)
-            progress_message.success("Monitoring sheet processed successfully.")
+            progress_message.success("OCR proposals are ready for day verification.")
         except ValueError as error:
             progress_message.empty()
             st.error(str(error))
         except Exception as error:
             progress_message.empty()
-            st.error(
-                "An unexpected error occurred while processing the monitoring sheet."
-            )
+            st.error("An unexpected error occurred while processing the sheet.")
             with st.expander("Technical error details"):
                 st.exception(error)
 
@@ -482,29 +805,50 @@ if (
 ):
     crop_data_urls = st.session_state.get("cell_crop_data_urls")
     if crop_data_urls is None:
+        thumbnail_start = time.perf_counter()
         crop_data_urls = build_cell_crop_data_url_lookup(prepared_sheet)
         st.session_state["cell_crop_data_urls"] = crop_data_urls
+        processing_metrics = st.session_state.get("processing_metrics")
+        if processing_metrics is not None:
+            thumbnail_seconds = time.perf_counter() - thumbnail_start
+            processing_metrics.add_seconds(
+                "ui_thumbnail_preparation_seconds",
+                thumbnail_seconds,
+            )
+            processing_metrics.recalculate_total()
+            st.session_state["processing_seconds"] = (
+                processing_metrics.total_sheet_processing_seconds
+            )
 
     st.divider()
     st.header("Processing results")
 
     blank_count = count_blank_cells(cell_results)
-    review_count = count_review_cells(cell_results)
-    review_row_count = sum(row["blocks_export"] for row in monitoring_rows)
+    day_state = state_for_sheet(
+        uploaded_fingerprint,
+        st.session_state.get("day_verification_state"),
+    )
+    st.session_state["day_verification_state"] = day_state
+    readiness = summarize_export_readiness(cell_results, day_state)
     metrics = st.columns(5)
-    metrics[0].metric("Total cells", len(cell_results))
-    metrics[1].metric("Blank cells", blank_count)
+    metrics[0].metric("Blocking cells", readiness.blocking_cell_count)
+    metrics[1].metric("Attention items", readiness.attention_item_count)
     metrics[2].metric(
-        "Accepted filled cells", count_accepted_filled_cells(cell_results)
+        "Operational warnings", readiness.operational_warning_count
     )
-    metrics[3].metric("Review cells", review_count)
-    metrics[4].metric(
-        "Processing time", f"{st.session_state['processing_seconds']:.1f} s"
+    metrics[3].metric(
+        "Confirmed days", f"{len(readiness.confirmed_days)} of 31"
     )
+    metrics[4].metric("Unconfirmed days", len(readiness.unconfirmed_days))
     st.caption(
-        f"{review_row_count} of {len(monitoring_rows)} monitoring rows "
-        "contain at least one export-blocking item."
+        f"Extraction used: **{prepared_sheet.geometry_mode.title()}** · "
+        f"Blank readings: {blank_count} · OCR processing time: "
+        f"{st.session_state['processing_seconds']:.1f} s"
     )
+    processing_metrics = st.session_state.get("processing_metrics")
+    if processing_metrics is not None:
+        with st.expander("Stage processing diagnostics"):
+            st.json(processing_metrics.to_dict())
     category_counts = Counter(
         category
         for result in cell_results
@@ -526,9 +870,211 @@ if (
         )
     )
 
-    table_tab, review_tab, preview_tab, export_tab = st.tabs(
-        ["Monitoring table", "Review items", "Sheet previews", "Export Excel"]
+    day_tab, table_tab, review_tab, preview_tab, export_tab = st.tabs(
+        [
+            "Day Verification",
+            "Full Monitoring Table",
+            "Detailed Review",
+            "Sheet Previews",
+            "Export Excel",
+        ]
     )
+
+    with day_tab:
+        st.subheader("Day Verification")
+        st.write(
+            "Verify one complete day beside its 16 exact filename-keyed crops. "
+            "Corrections save through the same canonical patch engine used by "
+            "the table and detailed review."
+        )
+        st.caption(
+            "Session-only work: closing this browser session or stopping "
+            "Streamlit clears unfinished verification."
+        )
+        day_flash = st.session_state.pop("day_flash", None)
+        if day_flash is not None:
+            getattr(st, day_flash["level"])(day_flash["message"])
+            for error_message in day_flash["errors"]:
+                st.caption(error_message)
+
+        st.progress(
+            len(readiness.confirmed_days) / 31,
+            text=f"{len(readiness.confirmed_days)} of 31 days confirmed",
+        )
+        selected_day_key = f"selected_day_{uploaded_fingerprint}"
+        st.session_state.setdefault(selected_day_key, 1)
+        with st.container(horizontal=True, vertical_alignment="bottom"):
+            st.button(
+                "Previous Day",
+                icon=":material/arrow_back:",
+                on_click=previous_day_callback,
+                args=(uploaded_fingerprint,),
+            )
+            selected_day = st.selectbox(
+                "Day",
+                options=list(range(1, 32)),
+                key=selected_day_key,
+                persist_state="session",
+                width=180,
+            )
+            if selected_day in day_state.confirmed_days:
+                st.badge(
+                    "Confirmed",
+                    color="green",
+                    icon=":material/check_circle:",
+                )
+            else:
+                st.badge(
+                    "Unconfirmed",
+                    color="orange",
+                    icon=":material/pending:",
+                )
+
+        current_day_results = results_for_day(cell_results, selected_day)
+        result_lookup = {
+            (result.point, result.reading_type): result
+            for result in current_day_results
+        }
+        cell_images = build_cell_image_lookup(prepared_sheet)
+        editor_version = st.session_state.get("day_editor_version", 0)
+        day_form_key = (
+            f"day_verification_form_{uploaded_fingerprint}_"
+            f"{selected_day}_{editor_version}"
+        )
+        badge_colors = {
+            "Blocking error": "red",
+            "Needs attention": "orange",
+            "Operational warning": "yellow",
+            "Confirmed": "green",
+            "Blank": "gray",
+        }
+
+        with st.form(day_form_key, enter_to_submit=True):
+            header = st.columns([0.5, 1.3, 1.2, 1.3, 1.2, 1.8])
+            for column, label in zip(
+                header,
+                (
+                    "Point",
+                    "Temperature crop",
+                    "Temperature value",
+                    "Humidity crop",
+                    "Humidity value",
+                    "Status",
+                ),
+            ):
+                column.markdown(f"**{label}**")
+
+            for point in range(1, 9):
+                temperature = result_lookup[(point, "temperature")]
+                humidity = result_lookup[(point, "humidity")]
+                row_columns = st.columns([0.5, 1.3, 1.2, 1.3, 1.2, 1.8])
+                row_columns[0].markdown(f"**{point}**")
+
+                for crop_column, result, short_label in (
+                    (row_columns[1], temperature, "T"),
+                    (row_columns[3], humidity, "H"),
+                ):
+                    crop_column.image(
+                        convert_bgr_to_rgb(cell_images[result.filename]),
+                        width="stretch",
+                    )
+                    with crop_column.popover(
+                        f"Enlarge {short_label}",
+                        icon=":material/zoom_in:",
+                        key=(
+                            f"day_crop_{uploaded_fingerprint}_{selected_day}_"
+                            f"{result.filename}"
+                        ),
+                    ):
+                        st.image(
+                            convert_bgr_to_rgb(cell_images[result.filename]),
+                            caption=result.filename,
+                            width="stretch",
+                        )
+
+                for value_column, result in (
+                    (row_columns[2], temperature),
+                    (row_columns[4], humidity),
+                ):
+                    value_column.text_input(
+                        (
+                            f"Day {selected_day}, Point {point}, "
+                            f"{result.reading_type} value"
+                        ),
+                        value=result.final_value,
+                        key=day_value_key(
+                            uploaded_fingerprint,
+                            selected_day,
+                            result.filename,
+                            editor_version,
+                        ),
+                        label_visibility="collapsed",
+                        placeholder="Example: 22.0",
+                    )
+                    value_column.checkbox(
+                        f"{result.reading_type.title()} blank",
+                        value=result.is_blank,
+                        key=day_blank_key(
+                            uploaded_fingerprint,
+                            selected_day,
+                            result.filename,
+                            editor_version,
+                        ),
+                    )
+
+                status_column = row_columns[5]
+                status_reasons: list[str] = []
+                for result, short_label in (
+                    (temperature, "T"),
+                    (humidity, "H"),
+                ):
+                    geometry_warning = (
+                        geometry_warning_for_filename(
+                            prepared_sheet.cells,
+                            result.filename,
+                        )
+                        if prepared_sheet.geometry_mode == "calibrated"
+                        else ""
+                    )
+                    status = cell_display_status(
+                        result,
+                        day_confirmed=selected_day in day_state.confirmed_days,
+                        geometry_warning=geometry_warning,
+                    )
+                    status_column.badge(
+                        f"{short_label}: {status.label}",
+                        color=badge_colors[status.label],
+                    )
+                    if status.reason:
+                        status_reasons.append(f"{short_label}: {status.reason}")
+                status_column.caption(" ".join(dict.fromkeys(status_reasons)))
+
+            with st.container(horizontal=True):
+                st.form_submit_button(
+                    "Confirm Day and Next",
+                    type="primary",
+                    icon=":material/check_circle:",
+                    on_click=submit_day_callback,
+                    args=(
+                        uploaded_fingerprint,
+                        selected_day,
+                        editor_version,
+                        True,
+                        True,
+                    ),
+                )
+                st.form_submit_button(
+                    "Save Day",
+                    icon=":material/save:",
+                    on_click=submit_day_callback,
+                    args=(
+                        uploaded_fingerprint,
+                        selected_day,
+                        editor_version,
+                        False,
+                        False,
+                    ),
+                )
 
     with preview_tab:
         st.subheader("Detected monitoring table")
@@ -703,7 +1249,11 @@ if (
                 )
 
     with review_tab:
-        review_results = [result for result in cell_results if result.blocks_export]
+        review_results = [
+            result
+            for result in cell_results
+            if result.blocks_export or result.review_categories
+        ]
         review_flash = st.session_state.pop("review_flash", None)
         if review_flash is not None:
             getattr(st, review_flash["level"])(review_flash["message"])
@@ -711,19 +1261,14 @@ if (
                 st.caption(error_message)
 
         if not review_results:
-            st.success("No readings currently block export.")
+            st.success("No readings need detailed inspection.")
         else:
-            st.warning(
-                f"{len(review_results)} readings contain blocking errors or "
-                "unresolved confirmations."
+            st.info(
+                f"{len(review_results)} reading(s) have detailed OCR, warning, "
+                "or verification context. Day Verification remains the primary "
+                "confirmation workflow."
             )
-            review_mode = st.segmented_control(
-                "Review mode",
-                ["Quick Batch Review", "Detailed Review"],
-                default="Quick Batch Review",
-                required=True,
-                key=f"review_mode_{uploaded_fingerprint}",
-            )
+            review_mode = "Detailed Review"
             result_by_filename = {
                 result.filename: result for result in review_results
             }
@@ -996,19 +1541,40 @@ if (
 
     with export_tab:
         st.subheader("Export final company workbook")
-        blocked_results = [
-            result for result in cell_results if result.blocks_export
-        ]
-        if blocked_results:
+        export_metrics = st.columns(5)
+        export_metrics[0].metric(
+            "Confirmed days", len(readiness.confirmed_days)
+        )
+        export_metrics[1].metric(
+            "Unconfirmed days", len(readiness.unconfirmed_days)
+        )
+        export_metrics[2].metric(
+            "Blocking cells", readiness.blocking_cell_count
+        )
+        export_metrics[3].metric(
+            "Blank mismatches", readiness.blank_mismatch_count
+        )
+        export_metrics[4].metric(
+            "Operational warnings", readiness.operational_warning_count
+        )
+        st.caption(
+            f"Extraction geometry recorded for this result: "
+            f"**{prepared_sheet.geometry_mode.title()}**"
+        )
+        if readiness.attention_item_count:
             st.warning(
-                f"{len(blocked_results)} reading(s) contain blocking errors or "
-                "unresolved confirmations."
+                f"{readiness.attention_item_count} unresolved attention item(s) "
+                "still require human confirmation."
             )
+        if not readiness.ready:
+            st.warning("The workbook is not ready for export.")
             st.write(
-                "Resolve all export-blocking Review items before downloading."
+                "Confirm every applicable day and resolve blocking values or "
+                "blank mismatches. Operational warnings remain visible but do "
+                "not independently block export."
             )
         else:
-            st.success("All flagged readings have been reviewed.")
+            st.success("All 31 days and final readings are export-ready.")
             st.write(
                 "The export uses the official template and preserves its logo, "
                 "formatting, formulas, borders, and print layout."
@@ -1018,36 +1584,38 @@ if (
                 placeholder="Example: July 2026",
                 key=f"export_month_year_{uploaded_fingerprint}",
             )
-            final_values_confirmed = st.checkbox(
-                "I have reviewed the final temperature and humidity values.",
-                key=f"export_confirmed_{uploaded_fingerprint}",
-            )
-            if not final_values_confirmed:
-                st.info(
-                    "Review the Monitoring table, then confirm the values to "
-                    "enable download."
+            try:
+                completed_workbook = create_monitoring_workbook(
+                    monitoring_rows=monitoring_rows,
+                    month_year=month_year_value,
                 )
+            except (ValueError, FileNotFoundError) as error:
+                st.error(str(error))
             else:
-                try:
-                    completed_workbook = create_monitoring_workbook(
-                        monitoring_rows=monitoring_rows,
-                        month_year=month_year_value,
-                    )
-                except (ValueError, FileNotFoundError) as error:
-                    st.error(str(error))
-                else:
-                    st.download_button(
-                        label="Download completed Excel file",
-                        data=completed_workbook,
-                        file_name=(
-                            "Data_Center_Temperature_Monitoring_Final.xlsx"
-                        ),
-                        mime=(
-                            "application/vnd.openxmlformats-officedocument."
-                            "spreadsheetml.sheet"
-                        ),
-                        type="primary",
-                    )
-                    st.caption(
-                        "The original template stored in templates is not modified."
-                    )
+                st.download_button(
+                    label="Download completed Excel file",
+                    data=completed_workbook,
+                    file_name="Data_Center_Temperature_Monitoring_Final.xlsx",
+                    mime=(
+                        "application/vnd.openxmlformats-officedocument."
+                        "spreadsheetml.sheet"
+                    ),
+                    type="primary",
+                )
+                st.caption(
+                    "The original template stored in templates is not modified."
+                )
+
+        audit_data = build_verification_audit(
+            day_state,
+            readiness,
+            prepared_sheet.geometry_mode,
+        )
+        with st.expander("Verification audit information"):
+            st.json(audit_data)
+            st.download_button(
+                "Download verification audit JSON",
+                data=json.dumps(audit_data, indent=2, sort_keys=True),
+                file_name="Data_Center_Monitoring_Verification_Audit.json",
+                mime="application/json",
+            )

@@ -1,8 +1,8 @@
 # Data Center Monthly Monitoring OCR
 
-This application converts photographed or scanned Toyota Data Center Monthly
-Monitoring Sheets into reviewed temperature and humidity records and exports
-them into the official Excel template.
+This OCR-assisted encoding application converts photographed or scanned Toyota
+Data Center Monthly Monitoring Sheets into human-verified temperature and
+humidity records and exports them into the official Excel template.
 
 The system is designed as a human-in-the-loop workflow. OCR produces proposed
 readings, while uncertain, malformed, anomalous, or inconsistent readings are
@@ -11,12 +11,17 @@ shown with their extracted handwritten crops for verification.
 ## Main features
 
 - Detects and straightens a photographed monitoring table.
+- Detects the complete printed Day 1-31 row span before building either grid.
+- Shows straight fixed and locally calibrated extraction previews before OCR.
+- Keeps fixed extraction as the conservative initial choice.
 - Extracts 496 measurement cells: 31 days x 8 points x 2 readings.
 - Detects blank cells before OCR.
 - Runs three image variants through PaddleOCR.
 - Records OCR agreement and confidence.
 - Validates format, absolute limits, blank consistency, and anomalies.
-- Provides image-assisted table editing and manual review.
+- Provides a primary 31-day verification workspace with all eight points and
+  exact handwritten crops for the selected day.
+- Provides secondary image-assisted table editing and detailed cell review.
 - Applies partial, filename-keyed updates without rerunning OCR.
 - Exports into a copy of the official Excel template while preserving its
   formatting, formulas, borders, logos, and print layout.
@@ -55,14 +60,18 @@ evaluation and calibration, not model-weight training.
 
 ```text
 Upload image
-    -> detect and straighten the table
-    -> extract 496 cells
+    -> detect the complete 32-boundary Day 1-31 row sequence
+    -> prepare straight fixed and locally calibrated previews without OCR
+    -> inspect overlays, representative crops, metrics, and warnings
+    -> explicitly choose fixed or locally calibrated extraction
+    -> run OCR
+    -> extract 496 cells using the chosen geometry
     -> classify blank cells
     -> preprocess nonblank crops
     -> run pretrained PaddleOCR
     -> select consensus predictions
     -> verify and flag readings
-    -> human review and sparse corrections
+    -> verify each day and apply sparse filename-keyed corrections
     -> export the official Excel workbook
 ```
 
@@ -120,6 +129,32 @@ minimal glare, blur, shadow, and perspective distortion.
 - Operational temperature warnings remain visible but do not automatically
   block export.
 - Export remains blocked while invalid values or required confirmations remain.
+- Export also remains blocked until all 31 applicable days are explicitly
+  confirmed.
+- Operational warnings remain visible but do not independently block day
+  confirmation or export.
+
+## Day Verification workflow
+
+After OCR, **Day Verification** is the primary workspace. Select a day to see
+Points 1 through 8 in company-form order. Every row shows temperature and
+humidity crop thumbnails, editable values, blank controls, compact status, and
+the reason attention is required. Crop lookups use the exact stable OCR-result
+filename, and each thumbnail can be enlarged.
+
+Pressing Enter inside the day form submits its first action, **Confirm Day and
+Next**. A successful confirmation saves only that day's controls, confirms all
+16 valid readings, and advances to the next unconfirmed day. **Save Day** keeps
+partial corrections without confirming the day. Editing a confirmed day later
+through any interface invalidates that day's confirmation.
+
+Full Monitoring Table, Detailed Review, Sheet Previews, and Export Excel remain
+secondary tabs. All edits update the same canonical `CellOCRResult` objects
+through the filename-keyed sparse patch engine and do not rerun OCR.
+
+Day confirmations and unfinished corrections persist only in the active
+Streamlit session. Closing the browser session or stopping Streamlit clears
+unfinished work; this stage intentionally adds no database.
 
 ## Running checks
 
@@ -128,6 +163,81 @@ minimal glare, blur, shadow, and perspective distortion.
 .\.venv\Scripts\python.exe -B -m unittest discover -s tests -v
 git diff --check
 ```
+
+## Geometry-only grid diagnostics
+
+The Stage 1 alignment diagnostic prepares and straightens a sheet, extracts the
+existing fixed 496-cell layout, and measures nearby printed grid lines. It does
+not import, initialize, or run PaddleOCR, and its uncalibrated score does not
+affect OCR or export behavior.
+
+```powershell
+.\.venv\Scripts\python.exe -B scripts\diagnose_grid_alignment.py `
+    --image test_images\sample.png `
+    --output output\grid_diagnostic\sample
+```
+
+Each run writes the standardized table, current grid overlay, detected-line
+overlay, the fixed days 1/16/31 by points 1/4/8 contact sheet, and an alignment
+JSON report. Reference coordinates remain the safe fallback. When at least 30
+of the 32 horizontal boundaries form a strong complete-sheet sequence, both
+extraction modes use that detected top/bottom span. Fixed mode keeps straight,
+evenly spaced rows; calibrated mode may additionally follow bounded local
+curvature.
+
+## Fixed-versus-calibrated OCR benchmark
+
+Stage 3A prepares a local, ignored 54-cell benchmark across the sample, April
+2026, and May 2026 sheets. Preparation writes wider context, fixed crops,
+calibrated crops, a labeling contact sheet, and `labels.csv` without importing
+or running PaddleOCR:
+
+```powershell
+.\.venv\Scripts\python.exe -B scripts\prepare_geometry_ocr_benchmark.py
+```
+
+Complete every missing `expected_value` in
+`local_benchmark/geometry_ab/labels.csv`. For a genuinely blank cell, leave the
+value empty and set `expected_blank` to `true`. Do not copy an OCR prediction
+into the ground-truth columns.
+
+After all labels are complete, run the controlled A/B benchmark explicitly:
+
+```powershell
+.\.venv\Scripts\python.exe -B scripts\run_geometry_ocr_benchmark.py `
+    --labels local_benchmark\geometry_ab\labels.csv `
+    --output local_benchmark\geometry_ab\results
+```
+
+The runner refuses incomplete or invalid labels before PaddleOCR is imported.
+It constructs the model once, measures first-inference warm-up separately, and
+uses the same production blank detection, three preprocessing variants,
+batching, postprocessing, and verification for both crop modes. Benchmark
+reports are evidence only and do not change the fixed production default.
+
+Stage 3B evaluates blankness on an aspect-preserving `112 x 40` analysis
+canvas, with the same interpolation, border exclusion, component filtering,
+and unchanged ink threshold for both crop geometries. Run its labeled
+before/after blank check without importing PaddleOCR:
+
+```powershell
+.\.venv\Scripts\python.exe -B scripts\evaluate_geometry_blank_analysis.py `
+    --labels local_benchmark\geometry_ab\labels.csv `
+    --output local_benchmark\geometry_ab\stage3b_blank_analysis
+```
+
+The 54-cell OCR runner now warms both crop shapes and times fixed and
+calibrated modes in both execution orders. It also derives a benchmark-only
+hybrid: stable low-drift sheets retain fixed crops, materially drifted sheets
+select calibrated crops, and calibrated selections or cross-mode
+disagreements remain confirmation-required. The hybrid is not used by
+Streamlit, does not select using ground truth, and does not change the fixed
+production geometry default.
+
+The Streamlit pipeline records observational stage timings and inference
+counters in the processing-results diagnostics expander. The development
+full-sheet runner also writes `processing_metrics.json` and a complete
+machine-readable `cell_results.csv` under `output/full_sheet_ocr/`.
 
 ## Local files and OCR speed
 
