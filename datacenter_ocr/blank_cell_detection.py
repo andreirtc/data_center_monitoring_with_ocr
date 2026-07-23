@@ -10,6 +10,11 @@ BLANK_ANALYSIS_CANVAS_WIDTH = 112
 BLANK_ANALYSIS_CANVAS_HEIGHT = 40
 BLANK_ANALYSIS_BORDER_EXCLUSION_RATIO = 0.06
 BLANK_ANALYSIS_CANVAS_EDGE_RATIO = 0.05
+LIKELY_BLANK_MAXIMUM_INK_RATIO = 0.012
+LIKELY_BLANK_MAXIMUM_COMPONENT_RATIO = 0.012
+LIKELY_BLANK_MAXIMUM_COMPONENT_WIDTH_RATIO = 0.08
+LIKELY_BLANK_MAXIMUM_COMPONENT_ASPECT_RATIO = 0.5
+VERTICAL_LINE_OCR_TOKENS = frozenset(("", "1", "I", "l", "|"))
 
 
 @dataclass(frozen=True)
@@ -22,6 +27,9 @@ class BlankCellAnalysis:
     ink_ratio: float
     significant_component_count: int
     largest_component_ratio: float
+    largest_component_width_ratio: float
+    largest_component_height_ratio: float
+    largest_component_aspect_ratio: float
     analysis_width: int
     analysis_height: int
     used_normalized_canvas: bool
@@ -211,6 +219,8 @@ def analyze_cell_for_blankness(
 
     significant_component_count = 0
     largest_component_area = 0
+    largest_component_width = 0
+    largest_component_height = 0
 
     # Component zero is the background, so iteration starts at one.
     for component_index in range(
@@ -230,10 +240,14 @@ def analyze_cell_for_blankness(
         ] = 255
 
         significant_component_count += 1
-        largest_component_area = max(
-            largest_component_area,
-            int(component_area),
-        )
+        if component_area > largest_component_area:
+            largest_component_area = int(component_area)
+            largest_component_width = int(
+                component_statistics[component_index, cv2.CC_STAT_WIDTH]
+            )
+            largest_component_height = int(
+                component_statistics[component_index, cv2.CC_STAT_HEIGHT]
+            )
 
     significant_ink_pixels = cv2.countNonZero(
         cleaned_ink_mask
@@ -246,6 +260,13 @@ def analyze_cell_for_blankness(
         / total_pixels
     )
     largest_component_ratio = largest_component_area / total_pixels
+    largest_component_width_ratio = largest_component_width / width
+    largest_component_height_ratio = largest_component_height / height
+    largest_component_aspect_ratio = (
+        largest_component_width / largest_component_height
+        if largest_component_height
+        else 0.0
+    )
 
     is_blank = (
         ink_ratio < ink_ratio_threshold
@@ -258,8 +279,54 @@ def analyze_cell_for_blankness(
             significant_component_count
         ),
         largest_component_ratio=largest_component_ratio,
+        largest_component_width_ratio=largest_component_width_ratio,
+        largest_component_height_ratio=largest_component_height_ratio,
+        largest_component_aspect_ratio=largest_component_aspect_ratio,
         analysis_width=width,
         analysis_height=height,
         used_normalized_canvas=normalize_analysis_canvas,
         cleaned_ink_mask=cleaned_ink_mask,
+    )
+
+
+def is_likely_border_artifact_blank(
+    analysis: BlankCellAnalysis,
+    normalized_predictions: dict[str, str],
+    raw_predictions: dict[str, str],
+    candidate_interpretations: tuple[str, ...],
+    *,
+    has_serious_geometry_warning: bool,
+) -> bool:
+    """Return whether combined evidence supports a reviewable blank proposal.
+
+    A line-like OCR result alone is deliberately insufficient. The crop must
+    also contain only one small, narrow component, have very little residual
+    ink, lack a plausible numeric interpretation, and have safe geometry.
+    """
+
+    available_texts = [
+        str(text).strip()
+        for predictions in (normalized_predictions, raw_predictions)
+        for text in predictions.values()
+    ]
+    line_like_ocr = (
+        bool(available_texts)
+        and any(text for text in available_texts)
+        and all(text in VERTICAL_LINE_OCR_TOKENS for text in available_texts)
+    )
+    return all(
+        (
+            not analysis.is_blank,
+            analysis.ink_ratio <= LIKELY_BLANK_MAXIMUM_INK_RATIO,
+            analysis.significant_component_count == 1,
+            analysis.largest_component_ratio
+            <= LIKELY_BLANK_MAXIMUM_COMPONENT_RATIO,
+            analysis.largest_component_width_ratio
+            <= LIKELY_BLANK_MAXIMUM_COMPONENT_WIDTH_RATIO,
+            analysis.largest_component_aspect_ratio
+            <= LIKELY_BLANK_MAXIMUM_COMPONENT_ASPECT_RATIO,
+            line_like_ocr,
+            not candidate_interpretations,
+            not has_serious_geometry_warning,
+        )
     )

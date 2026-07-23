@@ -21,8 +21,10 @@ from datacenter_ocr.excel_export import (
 from datacenter_ocr.day_verification import (
     DayVerificationState,
     apply_day_submission,
+    build_day_scroll_request,
     build_verification_audit,
     cell_display_status,
+    consume_day_scroll_request,
     invalidate_days_for_changes,
     previous_day,
     results_for_day,
@@ -72,6 +74,34 @@ st.set_page_config(
     page_title="Data Center Monitoring OCR",
     page_icon=":material/document_scanner:",
     layout="wide",
+)
+
+_SCROLL_TO_DAY_BANNER = st.components.v2.component(
+    "scroll_to_day_verification_banner",
+    html="<span aria-hidden='true'></span>",
+    css="""
+:host {
+  display: block;
+  height: 1px;
+}
+""",
+    js="""
+export default function (component) {
+  const message = component.data?.message
+  window.requestAnimationFrame(() => {
+    const alerts = Array.from(
+      document.querySelectorAll('[data-testid="stAlert"], [role="alert"]')
+    )
+    const target = alerts.find((alert) =>
+      message && alert.textContent?.includes(message)
+    )
+    if (target) {
+      target.style.scrollMarginTop = "1rem"
+      target.scrollIntoView({ behavior: "smooth", block: "start" })
+    }
+  })
+}
+""",
 )
 
 
@@ -143,6 +173,7 @@ def clear_previous_results() -> None:
         "day_verification_state",
         "day_editor_version",
         "day_flash",
+        "day_scroll_request",
         "table_editor_version",
         "cell_crop_data_urls",
         "review_flash",
@@ -474,14 +505,23 @@ def submit_day_callback(
             f"Saved {len(outcome.changed_filenames)} reading change(s) for Day "
             f"{day}. The day still requires confirmation."
         )
+    elif not confirm_day:
+        level = "success"
+        message = f"Day {day} was saved. No values changed."
     else:
-        level = "info"
-        message = f"No Day {day} values changed. The day remains unconfirmed."
+        level = "warning"
+        message = (
+            f"Day {day} was not confirmed because unresolved readings remain."
+        )
     st.session_state["day_flash"] = {
         "level": level,
         "message": message,
         "errors": outcome.errors,
     }
+    st.session_state["day_scroll_request"] = build_day_scroll_request(
+        uploaded_fingerprint,
+        outcome.next_day,
+    )
 
 
 def previous_day_callback(uploaded_fingerprint: str) -> None:
@@ -489,6 +529,7 @@ def previous_day_callback(uploaded_fingerprint: str) -> None:
 
     key = f"selected_day_{uploaded_fingerprint}"
     st.session_state[key] = previous_day(int(st.session_state.get(key, 1)))
+    st.session_state.pop("day_scroll_request", None)
 
 
 st.title("OCR-assisted monitoring sheet encoding")
@@ -929,25 +970,42 @@ if (
             "Session-only work: closing this browser session or stopping "
             "Streamlit clears unfinished verification."
         )
+        selected_day_key = f"selected_day_{uploaded_fingerprint}"
+        st.session_state.setdefault(selected_day_key, 1)
+        selected_day = int(st.session_state[selected_day_key])
         day_flash = st.session_state.pop("day_flash", None)
         if day_flash is not None:
             getattr(st, day_flash["level"])(day_flash["message"])
             for error_message in day_flash["errors"]:
                 st.caption(error_message)
+        should_scroll, remaining_scroll_request = consume_day_scroll_request(
+            st.session_state.get("day_scroll_request"),
+            uploaded_fingerprint,
+            selected_day,
+        )
+        if remaining_scroll_request is None:
+            st.session_state.pop("day_scroll_request", None)
+        else:
+            st.session_state["day_scroll_request"] = remaining_scroll_request
+        if should_scroll:
+            _SCROLL_TO_DAY_BANNER(
+                key=(
+                    f"day_scroll_{uploaded_fingerprint}_{selected_day}_"
+                    f"{st.session_state.get('day_editor_version', 0)}"
+                ),
+                data={
+                    "message": (
+                        day_flash["message"] if day_flash is not None else ""
+                    )
+                },
+                height=1,
+            )
 
         st.progress(
             len(readiness.confirmed_days) / 31,
             text=f"{len(readiness.confirmed_days)} of 31 days confirmed",
         )
-        selected_day_key = f"selected_day_{uploaded_fingerprint}"
-        st.session_state.setdefault(selected_day_key, 1)
         with st.container(horizontal=True, vertical_alignment="bottom"):
-            st.button(
-                "Previous Day",
-                icon=":material/arrow_back:",
-                on_click=previous_day_callback,
-                args=(uploaded_fingerprint,),
-            )
             selected_day = st.selectbox(
                 "Day",
                 options=list(range(1, 32)),
@@ -981,10 +1039,14 @@ if (
         )
         badge_colors = {
             "Blocking error": "red",
+            "Blocking format error": "red",
             "Needs attention": "orange",
             "Operational warning": "yellow",
             "Confirmed": "green",
             "Blank": "gray",
+            "Decimal inferred": "blue",
+            "Likely blank": "violet",
+            "Manually corrected": "blue",
         }
 
         with st.form(day_form_key, enter_to_submit=True):
@@ -1087,32 +1149,47 @@ if (
                         status_reasons.append(f"{short_label}: {status.reason}")
                 status_column.caption(" ".join(dict.fromkeys(status_reasons)))
 
-            with st.container(horizontal=True):
-                st.form_submit_button(
-                    "Confirm Day and Next",
-                    type="primary",
-                    icon=":material/check_circle:",
-                    on_click=submit_day_callback,
-                    args=(
-                        uploaded_fingerprint,
-                        selected_day,
-                        editor_version,
-                        True,
-                        True,
-                    ),
-                )
-                st.form_submit_button(
-                    "Save Day",
-                    icon=":material/save:",
-                    on_click=submit_day_callback,
-                    args=(
-                        uploaded_fingerprint,
-                        selected_day,
-                        editor_version,
-                        False,
-                        False,
-                    ),
-                )
+            action_columns = st.columns(
+                [1.2, 4.0, 1.2, 1.9],
+                vertical_alignment="center",
+            )
+            action_columns[3].form_submit_button(
+                "Confirm Day and Next",
+                type="primary",
+                icon=":material/check_circle:",
+                on_click=submit_day_callback,
+                args=(
+                    uploaded_fingerprint,
+                    selected_day,
+                    editor_version,
+                    True,
+                    True,
+                ),
+                key=f"confirm_day_{day_form_key}",
+                width="stretch",
+            )
+            action_columns[2].form_submit_button(
+                "Save Day",
+                icon=":material/save:",
+                on_click=submit_day_callback,
+                args=(
+                    uploaded_fingerprint,
+                    selected_day,
+                    editor_version,
+                    False,
+                    False,
+                ),
+                key=f"save_day_{day_form_key}",
+                width="stretch",
+            )
+            action_columns[0].form_submit_button(
+                "Previous Day",
+                icon=":material/arrow_back:",
+                on_click=previous_day_callback,
+                args=(uploaded_fingerprint,),
+                key=f"previous_day_{day_form_key}",
+                width="stretch",
+            )
 
         advanced_review_container = st.expander(
             "Advanced OCR details for troubleshooting",

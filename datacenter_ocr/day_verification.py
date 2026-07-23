@@ -55,6 +55,43 @@ class CellDisplayStatus:
     reason: str
 
 
+@dataclass(frozen=True)
+class DayScrollRequest:
+    """One-time request to bring a saved day's banner into view."""
+
+    sheet_fingerprint: str
+    destination_day: int
+
+
+def build_day_scroll_request(
+    sheet_fingerprint: str,
+    destination_day: int,
+) -> DayScrollRequest:
+    """Create a sheet- and destination-bound one-time scroll request."""
+
+    if not 1 <= destination_day <= EXPECTED_DAY_COUNT:
+        raise ValueError(
+            f"Day must be between 1 and {EXPECTED_DAY_COUNT}."
+        )
+    return DayScrollRequest(sheet_fingerprint, destination_day)
+
+
+def consume_day_scroll_request(
+    request: DayScrollRequest | None,
+    sheet_fingerprint: str,
+    selected_day: int,
+) -> tuple[bool, DayScrollRequest | None]:
+    """Consume a matching request and discard one belonging to another sheet."""
+
+    if request is None:
+        return False, None
+    if request.sheet_fingerprint != sheet_fingerprint:
+        return False, None
+    if request.destination_day == selected_day:
+        return True, None
+    return False, request
+
+
 def state_for_sheet(
     sheet_fingerprint: str,
     current_state: DayVerificationState | None = None,
@@ -328,13 +365,49 @@ def cell_display_status(
     """Choose one compact status without hiding secondary reasons."""
 
     if result.blocking_errors or result.has_blank_mismatch:
+        blocking_label = (
+            "Blocking format error"
+            if not result.format_is_valid
+            else "Blocking error"
+        )
         return CellDisplayStatus(
-            "Blocking error",
+            blocking_label,
             " ".join(result.blocking_errors) or result.review_reason,
         )
+    if (
+        result.postprocessing_status == "likely_blank"
+        and result.is_blank
+        and not day_confirmed
+    ):
+        reason = (
+            "Likely blank — only border-like ink was detected. "
+            "Confirm this day."
+        )
+        return CellDisplayStatus("Likely blank", reason)
     if result.is_blank:
         reason = "Verified blank." if day_confirmed else "Blank; confirm this day."
         return CellDisplayStatus("Blank", reason)
+    if (
+        result.postprocessing_status == "decimal_inferred"
+        and not result.human_verified
+    ):
+        reasons = list(result.required_confirmation_reasons)
+        reasons.extend(result.operational_warnings)
+        return CellDisplayStatus(
+            "Decimal inferred",
+            " ".join(dict.fromkeys(reasons))
+            or "Decimal point inferred; confirm this day.",
+        )
+    if (
+        result.postprocessing_status == "manually_corrected"
+        and not day_confirmed
+    ):
+        reasons = ["Manually corrected; confirm this day."]
+        reasons.extend(result.operational_warnings)
+        return CellDisplayStatus(
+            "Manually corrected",
+            " ".join(dict.fromkeys(reasons)),
+        )
     if (
         (result.required_confirmation_reasons and not result.human_verified)
         or geometry_warning

@@ -7,6 +7,8 @@ from unittest.mock import patch
 from datacenter_ocr.day_verification import (
     DayVerificationState,
     apply_day_submission,
+    build_day_scroll_request,
+    consume_day_scroll_request,
     invalidate_days_for_changes,
     next_unverified_day,
     previous_day,
@@ -203,6 +205,50 @@ class DaySubmissionTests(unittest.TestCase):
         self.assertTrue(outcome.day_confirmed)
         self.assertEqual(4, outcome.next_day)
 
+    def test_day_confirmation_accepts_valid_inferred_decimal(self) -> None:
+        inferred = replace(
+            self.results[0],
+            final_value="49.3",
+            postprocessing_status="decimal_inferred",
+            ocr_uncertainty_reasons=(
+                "Decimal point inferred from three-digit OCR text.",
+            ),
+            human_verified=False,
+        )
+        results = verify_cell_results([inferred, *self.results[1:]])
+
+        outcome = apply_day_submission(
+            results,
+            self.state,
+            1,
+            {},
+            confirm_day=True,
+            advance_after_confirmation=True,
+        )
+
+        self.assertTrue(outcome.day_confirmed)
+        confirmed = next(
+            result
+            for result in outcome.results
+            if result.filename == inferred.filename
+        )
+        self.assertTrue(confirmed.human_verified)
+        self.assertEqual("49.3", confirmed.final_value)
+
+    def test_save_day_stays_on_current_day(self) -> None:
+        target = self.results[0]
+        outcome = apply_day_submission(
+            self.results,
+            self.state,
+            1,
+            {target.filename: {"value": "23.0", "is_blank": False}},
+            confirm_day=False,
+            advance_after_confirmation=False,
+        )
+
+        self.assertEqual(1, outcome.next_day)
+        self.assertFalse(outcome.day_confirmed)
+
     def test_navigation_does_not_run_ocr(self) -> None:
         with patch(
             "datacenter_ocr.ocr_processing."
@@ -221,6 +267,38 @@ class DaySubmissionTests(unittest.TestCase):
 
 
 class DayStateAndExportTests(unittest.TestCase):
+    def test_one_time_scroll_request_matches_sheet_and_destination(self) -> None:
+        request = build_day_scroll_request("sheet-a", 2)
+
+        should_scroll, remaining = consume_day_scroll_request(
+            request,
+            "sheet-a",
+            2,
+        )
+
+        self.assertTrue(should_scroll)
+        self.assertIsNone(remaining)
+
+    def test_scroll_request_waits_for_destination_and_discards_other_sheet(
+        self,
+    ) -> None:
+        request = build_day_scroll_request("sheet-a", 2)
+        should_scroll, remaining = consume_day_scroll_request(
+            request,
+            "sheet-a",
+            1,
+        )
+        self.assertFalse(should_scroll)
+        self.assertEqual(request, remaining)
+
+        should_scroll, remaining = consume_day_scroll_request(
+            request,
+            "sheet-b",
+            2,
+        )
+        self.assertFalse(should_scroll)
+        self.assertIsNone(remaining)
+
     def test_edit_invalidates_prior_confirmation_only_for_changed_day(self) -> None:
         results = make_day(1) + make_day(2)
         state = DayVerificationState("sheet-a", frozenset({1, 2}))

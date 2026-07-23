@@ -58,13 +58,26 @@ class StreamlitDayVerificationContractTests(unittest.TestCase):
             ],
             key=lambda call: call.lineno,
         )
-        self.assertEqual(2, len(form_calls))
+        self.assertEqual(3, len(form_calls))
         self.assertIsInstance(form_calls[0].args[0], ast.Constant)
         self.assertEqual(
             "Confirm Day and Next",
             form_calls[0].args[0].value,
         )
-        self.assertEqual("Save Day", form_calls[1].args[0].value)
+        labels = [call.args[0].value for call in form_calls]
+        self.assertEqual(1, labels.count("Confirm Day and Next"))
+        self.assertEqual(1, labels.count("Save Day"))
+        self.assertEqual(1, labels.count("Previous Day"))
+
+    def test_day_actions_are_rendered_once_below_the_grid(self) -> None:
+        source = (PROJECT_ROOT / "streamlit_app.py").read_text(encoding="utf-8")
+
+        self.assertNotIn("top_controls", source)
+        self.assertIn("action_columns = st.columns", source)
+        self.assertLess(
+            source.index("for point in range(1, 9):"),
+            source.index("action_columns = st.columns"),
+        )
 
     def test_day_form_has_no_action_dropdown(self) -> None:
         day_form = self._day_form()

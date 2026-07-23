@@ -112,6 +112,16 @@ def validate_reading_value(
         )
 
     if EXACT_READING_PATTERN.fullmatch(text) is None:
+        if (
+            re.fullmatch(r"[0-9]{4,}", text)
+            or re.fullmatch(r"[0-9]+\.[0-9]{2,}", text)
+        ):
+            error = (
+                "Too many digits or decimal places; verify the handwritten "
+                "value."
+            )
+        else:
+            error = "Use exactly one decimal place, such as 22.0 or 53.3."
         return ValueValidation(
             text=text,
             normalized_value=None,
@@ -119,7 +129,7 @@ def validate_reading_value(
             is_blank=False,
             format_is_valid=False,
             within_absolute_limits=False,
-            error="Use exactly one decimal place, such as 22.0 or 53.3.",
+            error=error,
         )
 
     numeric_value = float(text)

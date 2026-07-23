@@ -10,8 +10,10 @@ import numpy as np
 from datacenter_ocr.blank_cell_detection import (
     BLANK_ANALYSIS_CANVAS_HEIGHT,
     BLANK_ANALYSIS_CANVAS_WIDTH,
+    BlankCellAnalysis,
     analyze_cell_for_blankness,
     create_blank_analysis_canvas,
+    is_likely_border_artifact_blank,
 )
 from datacenter_ocr.geometry_benchmark import (
     TELEMETRY_FIELDNAMES,
@@ -24,6 +26,10 @@ from datacenter_ocr.geometry_benchmark import (
     summarize_blank_analysis,
 )
 from datacenter_ocr.local_grid import BoundaryCurve
+from datacenter_ocr.ocr_processing import (
+    CellOCRResult,
+    apply_likely_blank_proposal,
+)
 from datacenter_ocr.sheet_processing import prepare_monitoring_sheet
 from scripts.run_geometry_ocr_benchmark import (
     counterbalanced_execution_orders,
@@ -172,6 +178,94 @@ class NormalizedBlankAnalysisTests(unittest.TestCase):
         self.assertEqual(
             [], summary["calibrated"]["filled_cells_newly_classified_blank"]
         )
+
+
+class LikelyBlankProposalTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.analysis = BlankCellAnalysis(
+            is_blank=False,
+            ink_ratio=0.006,
+            significant_component_count=1,
+            largest_component_ratio=0.006,
+            largest_component_width_ratio=0.04,
+            largest_component_height_ratio=0.35,
+            largest_component_aspect_ratio=0.3,
+            analysis_width=112,
+            analysis_height=40,
+            used_normalized_canvas=True,
+            cleaned_ink_mask=np.zeros((40, 112), dtype=np.uint8),
+        )
+        self.result = CellOCRResult(
+            filename="day_01_point_01_temperature.png",
+            day=1,
+            point=1,
+            reading_type="temperature",
+            predictions={"original": "1", "grayscale": "1", "contrast": ""},
+            raw_predictions={"original": "1", "grayscale": "I", "contrast": ""},
+            confidences={"original": 0.7, "grayscale": 0.6, "contrast": 0.0},
+            consensus_prediction="1",
+            agreement_count=2,
+            average_consensus_confidence=0.65,
+            final_value="1",
+            needs_review=True,
+            review_reason="No safe correction.",
+            postprocessing_status="no_safe_correction",
+        )
+
+    def test_combined_evidence_proposes_blank_and_clears_old_value(self) -> None:
+        proposed = apply_likely_blank_proposal(
+            self.result,
+            self.analysis,
+            {"filename": self.result.filename},
+        )
+
+        self.assertTrue(proposed.is_blank)
+        self.assertEqual("", proposed.final_value)
+        self.assertFalse(proposed.human_verified)
+        self.assertEqual("likely_blank", proposed.postprocessing_status)
+        self.assertIn("only border-like ink", proposed.review_reason)
+
+    def test_ocr_text_one_is_not_sufficient_by_itself(self) -> None:
+        stronger_ink = SimpleNamespace(
+            **{
+                **self.analysis.__dict__,
+                "ink_ratio": 0.04,
+            }
+        )
+
+        proposed = is_likely_border_artifact_blank(
+            stronger_ink,
+            self.result.predictions,
+            self.result.raw_predictions,
+            (),
+            has_serious_geometry_warning=False,
+        )
+
+        self.assertFalse(proposed)
+
+    def test_geometry_warning_prevents_likely_blank_proposal(self) -> None:
+        proposed = apply_likely_blank_proposal(
+            self.result,
+            self.analysis,
+            {
+                "filename": self.result.filename,
+                "geometry_rejection_reason": "Crop bounds were rejected.",
+            },
+        )
+
+        self.assertFalse(proposed.is_blank)
+        self.assertEqual("1", proposed.final_value)
+
+    def test_non_line_ocr_variant_prevents_likely_blank_proposal(self) -> None:
+        proposed = is_likely_border_artifact_blank(
+            self.analysis,
+            {**self.result.predictions, "contrast": "7"},
+            self.result.raw_predictions,
+            (),
+            has_serious_geometry_warning=False,
+        )
+
+        self.assertFalse(proposed)
 
 
 class GeometryTelemetryTests(unittest.TestCase):

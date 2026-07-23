@@ -13,6 +13,11 @@ DIAGNOSTIC_CELL_RESULT_FIELDS = [
     "reading_type",
     "is_blank",
     "blank_ink_ratio",
+    "blank_component_count",
+    "blank_largest_component_ratio",
+    "blank_largest_component_width_ratio",
+    "blank_largest_component_height_ratio",
+    "blank_largest_component_aspect_ratio",
     "raw_predictions_json",
     "normalized_predictions_json",
     "confidences_json",
@@ -73,6 +78,17 @@ def cell_result_to_diagnostic_row(result: Any) -> dict[str, Any]:
         "reading_type": result.reading_type,
         "is_blank": result.is_blank,
         "blank_ink_ratio": result.blank_ink_ratio,
+        "blank_component_count": result.blank_component_count,
+        "blank_largest_component_ratio": result.blank_largest_component_ratio,
+        "blank_largest_component_width_ratio": (
+            result.blank_largest_component_width_ratio
+        ),
+        "blank_largest_component_height_ratio": (
+            result.blank_largest_component_height_ratio
+        ),
+        "blank_largest_component_aspect_ratio": (
+            result.blank_largest_component_aspect_ratio
+        ),
         "raw_predictions_json": _json_mapping(result.raw_predictions),
         "normalized_predictions_json": _json_mapping(result.predictions),
         "confidences_json": _json_mapping(result.confidences),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 
 from datacenter_ocr.verification import (
     HUMIDITY_MAX,
@@ -11,6 +12,8 @@ from datacenter_ocr.verification import (
 )
 
 DECIMAL_PLACES = 1
+THREE_ASCII_DIGITS_PATTERN = re.compile(r"[0-9]{3}")
+FOUR_OR_MORE_ASCII_DIGITS_PATTERN = re.compile(r"[0-9]{4,}")
 
 
 @dataclass(frozen=True)
@@ -131,7 +134,7 @@ def insert_decimal_before_last_digit(
         217 becomes 21.7
     """
 
-    if not text.isdigit():
+    if re.fullmatch(r"[0-9]+", text) is None:
         return None
 
     if len(text) < 2:
@@ -206,8 +209,8 @@ def correct_numeric_prediction(
             changed=False,
             needs_review=True,
             reason=(
-                "OCR returned extra decimal digits; no digit was "
-                "discarded automatically."
+                "Too many digits or decimal places; verify the handwritten "
+                "value. No digit was discarded automatically."
             ),
             status="extra_decimal_digits",
             candidate_interpretations=(precision_adjusted,),
@@ -228,6 +231,47 @@ def correct_numeric_prediction(
             reason="Prediction already follows the expected format.",
             status="valid_unchanged",
             candidate_interpretations=(original_text,),
+        )
+
+    # Monitoring-sheet readings are written with one decimal place. For an
+    # exact three-digit ASCII OCR result, the operator-approved business rule
+    # gives DD.D precedence over broader leading/trailing-artifact guesses.
+    if THREE_ASCII_DIGITS_PATTERN.fullmatch(original_text):
+        inferred_value = insert_decimal_before_last_digit(original_text)
+        inferred_validation = validate_reading_value(
+            inferred_value,
+            reading_type,
+            allow_blank=False,
+        )
+        if (
+            inferred_validation.error is None
+            and inferred_validation.normalized_value is not None
+        ):
+            corrected_text = inferred_validation.normalized_value
+            return CorrectionResult(
+                original_text=original_text,
+                corrected_text=corrected_text,
+                changed=True,
+                needs_review=True,
+                reason=(
+                    "Decimal point inferred from three-digit OCR text. "
+                    "Human verification is required."
+                ),
+                status="decimal_inferred",
+                candidate_interpretations=(corrected_text,),
+            )
+
+        return CorrectionResult(
+            original_text=original_text,
+            corrected_text=original_text,
+            changed=False,
+            needs_review=True,
+            reason=(
+                "The inferred decimal value is outside the allowed "
+                f"{reading_type} range; verify the handwritten value."
+            ),
+            status="three_digit_inference_invalid",
+            candidate_interpretations=(),
         )
 
     # A decimal point with a missing or malformed digit cannot be
@@ -322,6 +366,23 @@ def correct_numeric_prediction(
                 "inserted a missing decimal point."
             ),
             reading_type=reading_type,
+        )
+
+    # Four-or-more digit OCR results are never resolved automatically. The
+    # candidates above remain useful evidence for the operator, but deleting
+    # a leading or trailing digit is too ambiguous to prefill as final.
+    if FOUR_OR_MORE_ASCII_DIGITS_PATTERN.fullmatch(original_text):
+        return CorrectionResult(
+            original_text=original_text,
+            corrected_text=original_text,
+            changed=False,
+            needs_review=True,
+            reason=(
+                "Too many digits or decimal places; verify the handwritten "
+                "value."
+            ),
+            status="too_many_digits",
+            candidate_interpretations=tuple(sorted(candidates)),
         )
 
 

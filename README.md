@@ -125,10 +125,16 @@ minimal glare, blur, shadow, and perspective distortion.
 ## Verification behavior
 
 - Final numeric values must contain exactly one decimal place.
+- Exact three-digit ASCII OCR text is proposed as `DD.D` when that value is
+  valid for the reading type; the proposal still requires human confirmation.
+- Four-or-more digits and excess decimal places are never silently truncated.
 - Temperature must be between 10.0 and 50.0.
 - Humidity must be between 0.0 and 100.0.
 - Low-confidence or materially disagreeing OCR variants require confirmation.
 - Ambiguous text such as `22.` is not silently repaired.
+- OCR text resembling a single vertical line is proposed as blank only when
+  low-ink, connected-component, multi-variant, and crop-geometry evidence all
+  support a border artifact.
 - A temperature/humidity blank mismatch remains blocking.
 - Operational temperature warnings remain visible but do not automatically
   block export.
@@ -148,9 +154,12 @@ filename, and each thumbnail can be enlarged.
 
 Pressing Enter inside the day form submits its first action, **Confirm Day and
 Next**. A successful confirmation saves only that day's controls, confirms all
-16 valid readings, and advances to the next unconfirmed day. **Save Day** keeps
-partial corrections without confirming the day. Editing a confirmed day later
-through any interface invalidates that day's confirmation.
+16 valid readings, advances to the next unconfirmed day, and scrolls once to
+the success banner near the top. **Save Day** keeps partial corrections without
+confirming the day, stays on the current day, and also returns to its result
+banner. Previous, save, and confirm controls are presented once in a compact
+action bar below the day grid. Editing a confirmed day later through any
+interface invalidates that day's confirmation.
 
 Full Monitoring Table, Sheet Previews, and Export Excel remain secondary tabs.
 Raw OCR variants and confidence values are available only in the collapsed

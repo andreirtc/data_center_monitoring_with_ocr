@@ -9,6 +9,8 @@ from datacenter_ocr.monitoring_records import (
     attach_crop_data_urls,
     build_monitoring_rows,
 )
+from datacenter_ocr.numeric_postprocessing import correct_numeric_prediction
+from datacenter_ocr.day_verification import cell_display_status
 from datacenter_ocr.review_workflow import (
     apply_monitoring_table_edits,
     apply_quick_review_controls,
@@ -84,6 +86,71 @@ class ValueValidationTests(unittest.TestCase):
         result = validate_reading_value("51.0", "temperature", allow_blank=False)
         self.assertTrue(result.format_is_valid)
         self.assertFalse(result.within_absolute_limits)
+
+
+class NumericPostprocessingTests(unittest.TestCase):
+    def test_three_digit_temperature_decimal_is_prefilled_for_review(self) -> None:
+        for source, expected in (("493", "49.3"), ("227", "22.7")):
+            with self.subTest(source=source):
+                correction = correct_numeric_prediction(source, "temperature")
+                self.assertEqual(expected, correction.corrected_text)
+                self.assertEqual("decimal_inferred", correction.status)
+                self.assertTrue(correction.needs_review)
+                self.assertIn("Decimal point inferred", correction.reason)
+
+    def test_out_of_range_three_digit_temperature_stays_invalid(self) -> None:
+        correction = correct_numeric_prediction("568", "temperature")
+
+        self.assertEqual("568", correction.corrected_text)
+        self.assertEqual("three_digit_inference_invalid", correction.status)
+        self.assertTrue(correction.needs_review)
+        self.assertFalse(correction.candidate_interpretations)
+
+    def test_three_digit_humidity_uses_dd_d_business_rule(self) -> None:
+        correction = correct_numeric_prediction("568", "humidity")
+
+        self.assertEqual("56.8", correction.corrected_text)
+        self.assertEqual("decimal_inferred", correction.status)
+        self.assertTrue(correction.needs_review)
+
+    def test_four_digits_and_excess_precision_remain_unresolved(self) -> None:
+        for source in ("4114", "2217", "41.14"):
+            with self.subTest(source=source):
+                correction = correct_numeric_prediction(source, "temperature")
+                self.assertEqual(source, correction.corrected_text)
+                self.assertTrue(correction.needs_review)
+                self.assertIn("Too many digits", correction.reason)
+
+    def test_inferred_decimal_remains_confirmation_required(self) -> None:
+        correction = correct_numeric_prediction("493", "temperature")
+        result = replace(
+            make_result(
+                day=1,
+                point=1,
+                reading_type="temperature",
+                value=correction.corrected_text,
+            ),
+            postprocessing_status=correction.status,
+            ocr_uncertainty_reasons=(correction.reason,),
+        )
+
+        verified = verify_cell_results([result])[0]
+
+        self.assertFalse(verified.human_verified)
+        self.assertTrue(verified.required_confirmation_reasons)
+        self.assertTrue(verified.blocks_export)
+        self.assertEqual("critical", verified.operational_severity)
+        self.assertTrue(verified.operational_warnings)
+        self.assertEqual(
+            "Decimal inferred",
+            cell_display_status(verified, day_confirmed=False).label,
+        )
+
+    def test_three_digit_inference_requires_ascii_digits(self) -> None:
+        correction = correct_numeric_prediction("４９３", "temperature")
+
+        self.assertEqual("４９３", correction.corrected_text)
+        self.assertNotEqual("decimal_inferred", correction.status)
 
 
 class ContextVerificationTests(unittest.TestCase):
@@ -187,6 +254,31 @@ class ContextVerificationTests(unittest.TestCase):
             all(BLANK_MISMATCH_CATEGORY in result.review_categories for result in verified)
         )
         self.assertTrue(all(result.blocking_errors for result in verified))
+        self.assertTrue(all(result.blocks_export for result in verified))
+
+    def test_one_sided_likely_blank_preserves_mismatch_blocking(self) -> None:
+        results = [
+            replace(
+                make_result(
+                    day=1,
+                    point=1,
+                    reading_type="temperature",
+                    value="",
+                    is_blank=True,
+                ),
+                postprocessing_status="likely_blank",
+            ),
+            make_result(
+                day=1,
+                point=1,
+                reading_type="humidity",
+                value="50.0",
+            ),
+        ]
+
+        verified = verify_cell_results(results)
+
+        self.assertTrue(all(result.has_blank_mismatch for result in verified))
         self.assertTrue(all(result.blocks_export for result in verified))
 
 

@@ -7,7 +7,11 @@ import re
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field, replace
-from datacenter_ocr.blank_cell_detection import analyze_cell_for_blankness
+from datacenter_ocr.blank_cell_detection import (
+    BlankCellAnalysis,
+    analyze_cell_for_blankness,
+    is_likely_border_artifact_blank,
+)
 from typing import Any
 
 import cv2
@@ -54,6 +58,11 @@ class CellOCRResult:
     review_reason: str
     is_blank: bool = False
     blank_ink_ratio: float = 0.0
+    blank_component_count: int = 0
+    blank_largest_component_ratio: float = 0.0
+    blank_largest_component_width_ratio: float = 0.0
+    blank_largest_component_height_ratio: float = 0.0
+    blank_largest_component_aspect_ratio: float = 0.0
     raw_predictions: dict[str, str] = field(default_factory=dict)
     ocr_uncertainty_reasons: tuple[str, ...] = ()
     human_verified: bool = False
@@ -72,6 +81,51 @@ class CellOCRResult:
     ocr_uncertain: bool = False
     postprocessing_status: str = "not_recorded"
     candidate_interpretations: tuple[str, ...] = ()
+
+
+def _cell_has_serious_geometry_warning(cell: dict[str, Any]) -> bool:
+    """Return whether crop geometry is too uncertain for a blank proposal."""
+
+    rejection_reason = str(cell.get("geometry_rejection_reason", "")).strip()
+    raw_confidence = cell.get("local_geometry_confidence")
+    confidence = 1.0 if raw_confidence is None else float(raw_confidence)
+    return bool(
+        rejection_reason
+        or cell.get("uses_fallback_geometry", False)
+        or confidence < 0.35
+    )
+
+
+def apply_likely_blank_proposal(
+    result: CellOCRResult,
+    analysis: BlankCellAnalysis,
+    cell: dict[str, Any],
+) -> CellOCRResult:
+    """Convert strong line-artifact evidence into a reviewable blank proposal."""
+
+    if not is_likely_border_artifact_blank(
+        analysis,
+        result.predictions,
+        result.raw_predictions,
+        result.candidate_interpretations,
+        has_serious_geometry_warning=_cell_has_serious_geometry_warning(cell),
+    ):
+        return result
+
+    reason = "Likely blank — only border-like ink was detected."
+    return replace(
+        result,
+        final_value="",
+        is_blank=True,
+        human_verified=False,
+        needs_review=True,
+        review_reason=reason,
+        ocr_uncertainty_reasons=tuple(
+            dict.fromkeys((*result.ocr_uncertainty_reasons, reason))
+        ),
+        postprocessing_status="likely_blank",
+        candidate_interpretations=(),
+    )
 
 
 def normalize_numeric_text(
@@ -734,6 +788,8 @@ def process_measurement_cells_with_blank_detection(
     filled_cells = []
     blank_results: dict[str, CellOCRResult] = {}
     ink_ratios: dict[str, float] = {}
+    blank_analyses: dict[str, BlankCellAnalysis] = {}
+    cells_by_filename = {cell["filename"]: cell for cell in cells}
 
     blank_detection_start = time.perf_counter()
 
@@ -743,6 +799,7 @@ def process_measurement_cells_with_blank_detection(
         )
 
         filename = cell["filename"]
+        blank_analyses[filename] = blank_analysis
 
         ink_ratios[filename] = round(
             blank_analysis.ink_ratio,
@@ -787,6 +844,23 @@ def process_measurement_cells_with_blank_detection(
 
             is_blank=True,
             blank_ink_ratio=ink_ratios[filename],
+            blank_component_count=blank_analysis.significant_component_count,
+            blank_largest_component_ratio=round(
+                blank_analysis.largest_component_ratio,
+                6,
+            ),
+            blank_largest_component_width_ratio=round(
+                blank_analysis.largest_component_width_ratio,
+                6,
+            ),
+            blank_largest_component_height_ratio=round(
+                blank_analysis.largest_component_height_ratio,
+                6,
+            ),
+            blank_largest_component_aspect_ratio=round(
+                blank_analysis.largest_component_aspect_ratio,
+                6,
+            ),
             postprocessing_status="skipped_blank",
         )
 
@@ -850,12 +924,35 @@ def process_measurement_cells_with_blank_detection(
     )
 
     for result in filled_results:
+        blank_analysis = blank_analyses[result.filename]
         result_with_blank_score = replace(
             result,
             is_blank=False,
             blank_ink_ratio=ink_ratios[
                 result.filename
             ],
+            blank_component_count=blank_analysis.significant_component_count,
+            blank_largest_component_ratio=round(
+                blank_analysis.largest_component_ratio,
+                6,
+            ),
+            blank_largest_component_width_ratio=round(
+                blank_analysis.largest_component_width_ratio,
+                6,
+            ),
+            blank_largest_component_height_ratio=round(
+                blank_analysis.largest_component_height_ratio,
+                6,
+            ),
+            blank_largest_component_aspect_ratio=round(
+                blank_analysis.largest_component_aspect_ratio,
+                6,
+            ),
+        )
+        result_with_blank_score = apply_likely_blank_proposal(
+            result_with_blank_score,
+            blank_analysis,
+            cells_by_filename[result.filename],
         )
 
         result_by_filename[

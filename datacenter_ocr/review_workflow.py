@@ -89,6 +89,14 @@ def apply_sparse_patches(
             final_value=proposed_value,
             is_blank=proposed_is_blank,
             human_verified=proposed_human_verified,
+            postprocessing_status=(
+                "manually_corrected"
+                if (
+                    proposed_value != current.final_value
+                    or proposed_is_blank != current.is_blank
+                )
+                else current.postprocessing_status
+            ),
         )
 
         if updated == current:
