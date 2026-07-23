@@ -49,10 +49,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--labels", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--recognition-strategy",
+        choices=("consensus", "adaptive"),
+        default="consensus",
+        help="Use production consensus or the review-required adaptive proposal path.",
+    )
     return parser
 
 
-def production_ocr_settings() -> dict[str, Any]:
+def production_ocr_settings(
+    recognition_strategy: str = "consensus",
+) -> dict[str, Any]:
     """Return the settings shared by both benchmark geometry modes."""
 
     from datacenter_ocr.ocr_processing import (
@@ -68,6 +76,7 @@ def production_ocr_settings() -> dict[str, Any]:
         "ocr_padding": OCR_PADDING,
         "paddle_batch_size": OCR_BATCH_SIZE,
         "cells_per_production_batch": CELLS_PER_BATCH,
+        "recognition_strategy": recognition_strategy,
         "blank_detection": "production analyze_cell_for_blankness",
         "postprocessing": "production correct_numeric_prediction",
         "verification": "production verify_cell_results",
@@ -79,6 +88,7 @@ def _predict_one_mode(
     model: Any,
     cells: Sequence[dict[str, Any]],
     processor: Callable[..., list[Any]],
+    recognition_strategy: str = "consensus",
 ) -> tuple[list[Any], ProcessingMetrics, float]:
     """Predict sheet-by-sheet so production contextual checks never cross sheets."""
 
@@ -103,6 +113,7 @@ def _predict_one_mode(
                 cells=prediction_cells,
                 cells_per_batch=CELLS_PER_BATCH,
                 metrics=metrics,
+                recognition_strategy=recognition_strategy,
             )
         )
     return results, metrics, time.perf_counter() - start
@@ -178,6 +189,7 @@ def _run_counterbalanced_predictions(
     model: Any,
     cells_by_mode: Mapping[str, Sequence[dict[str, Any]]],
     processor: Callable[..., list[Any]],
+    recognition_strategy: str = "consensus",
 ) -> tuple[dict[str, list[Any]], dict[str, dict[str, Any]], bool]:
     """Run fixed/calibrated twice in opposite orders and average timing."""
 
@@ -196,6 +208,7 @@ def _run_counterbalanced_predictions(
                 model=model,
                 cells=cells_by_mode[geometry_mode],
                 processor=processor,
+                recognition_strategy=recognition_strategy,
             )
             signature = _result_signature(results)
             if geometry_mode not in representative_results:
@@ -281,7 +294,11 @@ def _join_results(
     return evaluated
 
 
-def run_benchmark(labels_path: Path, output_folder: Path) -> dict[str, Any]:
+def run_benchmark(
+    labels_path: Path,
+    output_folder: Path,
+    recognition_strategy: str = "consensus",
+) -> dict[str, Any]:
     """Validate labels, then run fixed/calibrated/hybrid on only 54 cells."""
 
     labels_path = labels_path.resolve()
@@ -308,8 +325,8 @@ def run_benchmark(labels_path: Path, output_folder: Path) -> dict[str, Any]:
             "Benchmark manifest sheet alignment metrics do not match labels. "
             "Regenerate Stage 3B geometry artifacts before running OCR."
         )
-    fixed_settings = production_ocr_settings()
-    calibrated_settings = production_ocr_settings()
+    fixed_settings = production_ocr_settings(recognition_strategy)
+    calibrated_settings = production_ocr_settings(recognition_strategy)
     if fixed_settings != calibrated_settings:
         raise RuntimeError("Fixed and calibrated OCR settings are not identical.")
 
@@ -334,6 +351,7 @@ def run_benchmark(labels_path: Path, output_folder: Path) -> dict[str, Any]:
             model=model,
             cells_by_mode=cells_by_mode,
             processor=process_measurement_cells_with_blank_detection,
+            recognition_strategy=recognition_strategy,
         )
     )
     if not predictions_consistent:
@@ -476,6 +494,7 @@ def run_benchmark(labels_path: Path, output_folder: Path) -> dict[str, Any]:
             "variant."
         ),
         "production_geometry_default_changed": False,
+        "production_recognition_strategy_changed": False,
     }
     (output_folder / "benchmark_run_manifest.json").write_text(
         json.dumps(run_manifest, indent=2, sort_keys=True) + "\n",
@@ -488,7 +507,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the benchmark only after every required label is complete."""
 
     arguments = build_parser().parse_args(argv)
-    report = run_benchmark(arguments.labels, arguments.output)
+    report = run_benchmark(
+        arguments.labels,
+        arguments.output,
+        arguments.recognition_strategy,
+    )
     print(
         json.dumps(
             {

@@ -107,8 +107,20 @@ class StreamlitDayVerificationContractTests(unittest.TestCase):
         labels = [item.value for item in tabs_call.args[0].elts]
         self.assertEqual("Day Verification", labels[0])
         self.assertIn("Full Monitoring Table", labels)
-        self.assertIn("Detailed Review", labels)
+        self.assertNotIn("Detailed Review", labels)
         self.assertIn("Export Excel", labels)
+
+    def test_detailed_ocr_data_is_demoted_to_troubleshooting(self) -> None:
+        source = (PROJECT_ROOT / "streamlit_app.py").read_text(encoding="utf-8")
+        self.assertIn(
+            "Advanced OCR details for troubleshooting",
+            source,
+        )
+        self.assertNotIn('"Save detailed review"', source)
+
+    def test_full_sheet_uses_adaptive_review_required_ocr(self) -> None:
+        source = (PROJECT_ROOT / "streamlit_app.py").read_text(encoding="utf-8")
+        self.assertIn('recognition_strategy="adaptive"', source)
 
     def test_preflight_summary_optional_keys_are_hot_reload_safe(self) -> None:
         source = (PROJECT_ROOT / "streamlit_app.py").read_text(encoding="utf-8")

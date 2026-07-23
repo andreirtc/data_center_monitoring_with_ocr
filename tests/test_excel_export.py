@@ -9,7 +9,9 @@ from xml.etree import ElementTree
 from datacenter_ocr.config import EXCEL_TEMPLATE_PATH
 from datacenter_ocr.excel_export import (
     WORKSHEET_XML_PATH,
+    build_excel_mapping_audit,
     create_monitoring_workbook,
+    excel_cell_address,
 )
 
 
@@ -45,6 +47,35 @@ def worksheet_value(workbook_bytes: bytes, address: str) -> str | None:
 
 
 class ExcelExportTests(unittest.TestCase):
+    def test_all_496_readings_keep_their_exact_excel_destination(self) -> None:
+        rows = complete_rows()
+        for index, row in enumerate(rows):
+            row["temperature"] = f"{10.0 + index / 10:.1f}"
+            row["humidity"] = f"{50.0 + index / 10:.1f}"
+            row["temperature_filename"] = (
+                f"day_{row['day']:02d}_point_{row['point']:02d}_temperature.png"
+            )
+            row["humidity_filename"] = (
+                f"day_{row['day']:02d}_point_{row['point']:02d}_humidity.png"
+            )
+
+        workbook_bytes = create_monitoring_workbook(rows)
+        audit_rows = build_excel_mapping_audit(rows)
+
+        self.assertEqual(496, len(audit_rows))
+        self.assertEqual(496, len({row["excel_cell"] for row in audit_rows}))
+        for audit_row in audit_rows:
+            expected_address = excel_cell_address(
+                audit_row["day"],
+                audit_row["point"],
+                audit_row["reading_type"],
+            )
+            self.assertEqual(expected_address, audit_row["excel_cell"])
+            self.assertEqual(
+                audit_row["final_value"],
+                worksheet_value(workbook_bytes, expected_address),
+            )
+
     def test_export_preserves_template_and_formula_nodes(self) -> None:
         template_bytes = EXCEL_TEMPLATE_PATH.read_bytes()
         template_hash = hashlib.sha256(template_bytes).hexdigest()

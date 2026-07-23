@@ -26,6 +26,7 @@ from datacenter_ocr.diagnostic_export import (
     DIAGNOSTIC_CELL_RESULT_FIELDS,
     write_cell_results_csv,
 )
+from datacenter_ocr.extraction_preflight import recommended_geometry_mode
 from datacenter_ocr.grid_diagnostics import (
     ALIGNMENT_REPORT_FILENAME,
     CONTACT_SHEET_FILENAME,
@@ -42,6 +43,7 @@ from datacenter_ocr.local_grid import align_measurement_boxes_to_printed_rows
 from datacenter_ocr.ocr_processing import (
     CellOCRResult,
     process_measurement_cells,
+    process_measurement_cells_adaptive,
 )
 from datacenter_ocr.processing_metrics import ProcessingMetrics
 from datacenter_ocr.sheet_processing import PreparedMonitoringSheet
@@ -308,6 +310,25 @@ class GridDiagnosticTests(unittest.TestCase):
 
 
 class MetricsAndExportTests(unittest.TestCase):
+    def test_calibrated_is_default_only_after_geometry_guards_pass(self) -> None:
+        passing_summary = {
+            "row_sequence_alignment_used": True,
+            "fixed_cell_count": 496,
+            "calibrated_cell_count": 496,
+            "invalid_calibrated_cell_count": 0,
+            "fallback_boundary_count": 2,
+        }
+        self.assertEqual("calibrated", recommended_geometry_mode(passing_summary))
+
+        for failed_field, failed_value in (
+            ("row_sequence_alignment_used", False),
+            ("fixed_cell_count", 495),
+            ("calibrated_cell_count", 495),
+            ("invalid_calibrated_cell_count", 1),
+        ):
+            failed_summary = {**passing_summary, failed_field: failed_value}
+            self.assertEqual("fixed", recommended_geometry_mode(failed_summary))
+
     def test_timing_result_schema(self) -> None:
         metrics = ProcessingMetrics()
         expected_fields = {
@@ -331,6 +352,9 @@ class MetricsAndExportTests(unittest.TestCase):
             "model_predict_call_count",
             "requested_batch_size",
             "result_batch_count",
+            "recognition_strategy",
+            "adaptive_first_pass_cell_count",
+            "adaptive_fallback_cell_count",
             "process_uptime_seconds",
             "model_was_warm",
             "uploaded_width",
@@ -376,6 +400,65 @@ class MetricsAndExportTests(unittest.TestCase):
         self.assertEqual(1, metrics.model_predict_call_count)
         self.assertEqual(16, metrics.requested_batch_size)
         self.assertEqual(1, metrics.result_batch_count)
+
+    def test_adaptive_ocr_keeps_safe_grayscale_as_reviewable_proposal(self) -> None:
+        class FakeResult:
+            json = {"res": {"rec_text": "22.0", "rec_score": 0.99}}
+
+        class FakeModel:
+            def predict(self, *, input: list[np.ndarray], batch_size: int):
+                del batch_size
+                return [FakeResult() for _ in input]
+
+        cell = {
+            "filename": "day_01_point_01_temperature.png",
+            "day": 1,
+            "point": 1,
+            "reading_type": "temperature",
+            "image": np.full((40, 80, 3), 255, dtype=np.uint8),
+        }
+        metrics = ProcessingMetrics(model_was_warm=True)
+        result = process_measurement_cells_adaptive(
+            FakeModel(), [cell], metrics=metrics
+        )[0]
+
+        self.assertEqual("22.0", result.final_value)
+        self.assertEqual(1, result.agreement_count)
+        self.assertTrue(result.blocks_export)
+        self.assertEqual(1, metrics.ocr_input_image_count)
+        self.assertEqual(1, metrics.adaptive_first_pass_cell_count)
+        self.assertEqual(0, metrics.adaptive_fallback_cell_count)
+
+    def test_adaptive_ocr_retries_malformed_first_pass_with_consensus(self) -> None:
+        class FakeResult:
+            def __init__(self, text: str):
+                self.json = {"res": {"rec_text": text, "rec_score": 0.99}}
+
+        class FakeModel:
+            call_count = 0
+
+            def predict(self, *, input: list[np.ndarray], batch_size: int):
+                del batch_size
+                self.call_count += 1
+                text = "22." if self.call_count == 1 else "22.0"
+                return [FakeResult(text) for _ in input]
+
+        cell = {
+            "filename": "day_01_point_01_temperature.png",
+            "day": 1,
+            "point": 1,
+            "reading_type": "temperature",
+            "image": np.full((40, 80, 3), 255, dtype=np.uint8),
+        }
+        metrics = ProcessingMetrics(model_was_warm=True)
+        result = process_measurement_cells_adaptive(
+            FakeModel(), [cell], metrics=metrics
+        )[0]
+
+        self.assertEqual("22.0", result.final_value)
+        self.assertEqual(2, result.agreement_count)
+        self.assertEqual(3, metrics.ocr_input_image_count)
+        self.assertEqual(1, metrics.adaptive_fallback_cell_count)
 
     def test_diagnostic_csv_serializes_all_verification_fields(self) -> None:
         output_path = PROJECT_ROOT / "output" / "_stage1_cell_results_test.csv"

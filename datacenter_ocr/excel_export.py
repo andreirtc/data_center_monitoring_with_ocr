@@ -50,6 +50,71 @@ HUMIDITY_COLUMNS = {
 }
 
 
+def excel_cell_address(
+    day: int,
+    point: int,
+    reading_type: str,
+) -> str:
+    """Return the official-template address for one identified reading."""
+
+    if not 1 <= day <= EXPECTED_DAY_COUNT:
+        raise ValueError(f"Invalid day number: {day}.")
+    if not 1 <= point <= EXPECTED_POINT_COUNT:
+        raise ValueError(f"Invalid point number: {point}.")
+
+    if reading_type == "temperature":
+        column = TEMPERATURE_COLUMNS[point]
+    elif reading_type == "humidity":
+        column = HUMIDITY_COLUMNS[point]
+    else:
+        raise ValueError(f"Invalid reading type: {reading_type}.")
+
+    return f"{column}{DATA_START_ROW + day - 1}"
+
+
+def build_excel_mapping_audit(
+    monitoring_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Describe all 496 filename-keyed source-to-workbook destinations.
+
+    The same completeness and export-readiness checks used by workbook
+    creation are applied so this audit cannot describe a partial export.
+    """
+
+    indexed_rows = _index_monitoring_rows(monitoring_rows)
+    audit_rows: list[dict[str, Any]] = []
+
+    for day in range(1, EXPECTED_DAY_COUNT + 1):
+        for point in range(1, EXPECTED_POINT_COUNT + 1):
+            monitoring_row = indexed_rows[(day, point)]
+            for reading_type in ("temperature", "humidity"):
+                audit_rows.append(
+                    {
+                        "day": day,
+                        "point": point,
+                        "reading_type": reading_type,
+                        "source_filename": monitoring_row.get(
+                            f"{reading_type}_filename",
+                            "",
+                        ),
+                        "final_value": monitoring_row.get(reading_type, ""),
+                        "excel_cell": excel_cell_address(
+                            day,
+                            point,
+                            reading_type,
+                        ),
+                    }
+                )
+
+    expected_reading_count = EXPECTED_MONITORING_ROW_COUNT * 2
+    if len(audit_rows) != expected_reading_count:
+        raise RuntimeError(
+            f"Expected {expected_reading_count} Excel mapping rows, "
+            f"but generated {len(audit_rows)}."
+        )
+    return audit_rows
+
+
 def _remove_cell_type_attribute(
     attributes: bytes,
 ) -> bytes:
@@ -428,12 +493,6 @@ def create_monitoring_workbook(
             1,
             EXPECTED_DAY_COUNT + 1,
         ):
-            excel_row = (
-                DATA_START_ROW
-                + day
-                - 1
-            )
-
             for point in range(
                 1,
                 EXPECTED_POINT_COUNT + 1,
@@ -468,14 +527,16 @@ def create_monitoring_workbook(
                     )
                 )
 
-                temperature_cell = (
-                    f"{TEMPERATURE_COLUMNS[point]}"
-                    f"{excel_row}"
+                temperature_cell = excel_cell_address(
+                    day,
+                    point,
+                    "temperature",
                 )
 
-                humidity_cell = (
-                    f"{HUMIDITY_COLUMNS[point]}"
-                    f"{excel_row}"
+                humidity_cell = excel_cell_address(
+                    day,
+                    point,
+                    "humidity",
                 )
 
                 worksheet_xml = (

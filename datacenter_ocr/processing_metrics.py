@@ -32,10 +32,11 @@ class ProcessingMetrics:
     verification, review, or export decisions.
     """
 
-    schema_version: int = 1
+    schema_version: int = 2
     source_filename: str = ""
     uploaded_fingerprint: str = ""
     extraction_geometry_mode: str = "fixed"
+    recognition_strategy: str = "consensus"
     uploaded_width: int = 0
     uploaded_height: int = 0
     process_uptime_seconds: float = 0.0
@@ -63,6 +64,8 @@ class ProcessingMetrics:
     model_predict_call_count: int = 0
     requested_batch_size: int = 0
     result_batch_count: int = 0
+    adaptive_first_pass_cell_count: int = 0
+    adaptive_fallback_cell_count: int = 0
 
     def add_seconds(self, field_name: str, elapsed_seconds: float) -> None:
         """Add elapsed time to a named timing field."""

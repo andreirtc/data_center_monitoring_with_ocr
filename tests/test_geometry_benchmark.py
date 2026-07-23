@@ -184,6 +184,11 @@ class GeometryBenchmarkParityTests(unittest.TestCase):
             settings["preprocessing_variants"],
         )
         self.assertEqual(32, settings["cells_per_production_batch"])
+        self.assertEqual("consensus", settings["recognition_strategy"])
+        self.assertEqual(
+            "adaptive",
+            production_ocr_settings("adaptive")["recognition_strategy"],
+        )
 
     def test_prediction_cells_never_contain_ground_truth(self) -> None:
         identity = benchmark_identities()[0]

@@ -14,7 +14,10 @@ import pandas as pd
 from paddleocr import TextRecognition
 import streamlit as st
 
-from datacenter_ocr.excel_export import create_monitoring_workbook
+from datacenter_ocr.excel_export import (
+    build_excel_mapping_audit,
+    create_monitoring_workbook,
+)
 from datacenter_ocr.day_verification import (
     DayVerificationState,
     apply_day_submission,
@@ -29,6 +32,7 @@ from datacenter_ocr.day_verification import (
 from datacenter_ocr.extraction_preflight import (
     build_alignment_preflight_summary,
     geometry_warning_for_filename,
+    recommended_geometry_mode,
     representative_crop_pairs,
 )
 from datacenter_ocr.grid_diagnostics import calculate_alignment_report
@@ -681,10 +685,11 @@ if fixed_preflight_sheet is not None and calibrated_preflight_sheet is not None:
             width="stretch",
         )
 
+    recommended_geometry = recommended_geometry_mode(alignment_summary)
     geometry_choice = st.segmented_control(
         "Extraction geometry",
         options=["fixed", "calibrated"],
-        default="fixed",
+        default=recommended_geometry,
         required=True,
         format_func=lambda mode: (
             "Fixed extraction" if mode == "fixed" else "Locally calibrated extraction"
@@ -692,10 +697,17 @@ if fixed_preflight_sheet is not None and calibrated_preflight_sheet is not None:
         key=f"geometry_choice_{uploaded_fingerprint}",
         persist_state="session",
     )
-    st.caption(
-        "Fixed is the conservative initial default. The choice is based only "
-        "on the extraction preview and alignment evidence—not OCR values."
-    )
+    if recommended_geometry == "calibrated":
+        st.caption(
+            "Locally calibrated extraction is recommended because the complete "
+            "printed row sequence and all 496 calibrated cells passed geometry "
+            "checks. Fixed extraction remains available as a recovery option."
+        )
+    else:
+        st.warning(
+            "Fixed extraction is recommended because calibrated geometry did "
+            "not pass every default-selection guard. Inspect both overlays."
+        )
 
     current_result_matches_choice = (
         st.session_state.get("processed_fingerprint") == uploaded_fingerprint
@@ -706,6 +718,11 @@ if fixed_preflight_sheet is not None and calibrated_preflight_sheet is not None:
         type="primary",
         icon=":material/document_scanner:",
         disabled=current_result_matches_choice,
+    )
+    st.caption(
+        "OCR uses a grayscale first pass. Already-valid proposals remain "
+        "confirmation-required; malformed, normalized, or out-of-range text "
+        "automatically receives the full three-variant consensus pass."
     )
     if current_result_matches_choice:
         st.info(
@@ -752,6 +769,7 @@ if fixed_preflight_sheet is not None and calibrated_preflight_sheet is not None:
                 cells_per_batch=CELLS_PER_PROCESSING_BATCH,
                 progress_callback=update_progress,
                 metrics=processing_metrics,
+                recognition_strategy="adaptive",
             )
             ocr_resource.prediction_call_count += (
                 processing_metrics.model_predict_call_count
@@ -847,7 +865,28 @@ if (
     )
     processing_metrics = st.session_state.get("processing_metrics")
     if processing_metrics is not None:
-        with st.expander("Stage processing diagnostics"):
+        avoided_inputs = max(
+            processing_metrics.filled_cell_count * 3
+            - processing_metrics.ocr_input_image_count,
+            0,
+        )
+        input_note = (
+            f"Adaptive first-pass reuse avoided {avoided_inputs} inputs."
+            if getattr(
+                processing_metrics,
+                "recognition_strategy",
+                "consensus",
+            )
+            == "adaptive"
+            else "This saved result used the full consensus strategy."
+        )
+        st.caption(
+            f"OCR prediction used {processing_metrics.ocr_prediction_seconds:.1f} "
+            f"of {processing_metrics.total_sheet_processing_seconds:.1f} seconds "
+            f"across {processing_metrics.ocr_input_image_count} model inputs. "
+            f"{input_note}"
+        )
+        with st.expander("Advanced processing diagnostics (troubleshooting)"):
             st.json(processing_metrics.to_dict())
     category_counts = Counter(
         category
@@ -870,11 +909,10 @@ if (
         )
     )
 
-    day_tab, table_tab, review_tab, preview_tab, export_tab = st.tabs(
+    day_tab, table_tab, preview_tab, export_tab = st.tabs(
         [
             "Day Verification",
             "Full Monitoring Table",
-            "Detailed Review",
             "Sheet Previews",
             "Export Excel",
         ]
@@ -1076,6 +1114,11 @@ if (
                     ),
                 )
 
+        advanced_review_container = st.expander(
+            "Advanced OCR details for troubleshooting",
+            expanded=False,
+        )
+
     with preview_tab:
         st.subheader("Detected monitoring table")
         st.image(
@@ -1248,7 +1291,7 @@ if (
                     args=(uploaded_fingerprint, editor_key, base_rows),
                 )
 
-    with review_tab:
+    with advanced_review_container:
         review_results = [
             result
             for result in cell_results
@@ -1515,30 +1558,6 @@ if (
                 with st.expander("Neighboring and same-day context"):
                     st.dataframe(context_rows, hide_index=True)
 
-                detailed_action = st.selectbox(
-                    "Action",
-                    REVIEW_ACTIONS,
-                    key=review_action_key(
-                        uploaded_fingerprint, current_result.filename
-                    ),
-                    persist_state="session",
-                )
-                if detailed_action == "Enter correction":
-                    st.text_input(
-                        "Corrected value",
-                        placeholder="Example: 22.0",
-                        key=review_correction_key(
-                            uploaded_fingerprint, current_result.filename
-                        ),
-                        persist_state="session",
-                    )
-                st.button(
-                    "Save detailed review",
-                    type="primary",
-                    on_click=save_review_batch_callback,
-                    args=(uploaded_fingerprint, [current_result.filename]),
-                )
-
     with export_tab:
         st.subheader("Export final company workbook")
         export_metrics = st.columns(5)
@@ -1602,8 +1621,26 @@ if (
                     ),
                     type="primary",
                 )
+                mapping_audit_rows = build_excel_mapping_audit(monitoring_rows)
+                mapping_audit_csv = pd.DataFrame(mapping_audit_rows).rename(
+                    columns={
+                        "day": "Day",
+                        "point": "Point",
+                        "reading_type": "Reading Type",
+                        "source_filename": "Source Filename",
+                        "final_value": "Final Value",
+                        "excel_cell": "Excel Cell",
+                    }
+                ).to_csv(index=False)
+                st.download_button(
+                    label="Download Excel mapping audit CSV",
+                    data=mapping_audit_csv,
+                    file_name="Data_Center_Monitoring_Excel_Mapping_Audit.csv",
+                    mime="text/csv",
+                )
                 st.caption(
-                    "The original template stored in templates is not modified."
+                    "The mapping audit lists every source crop and its exact "
+                    "Excel destination. The original template is not modified."
                 )
 
         audit_data = build_verification_audit(
@@ -1611,7 +1648,7 @@ if (
             readiness,
             prepared_sheet.geometry_mode,
         )
-        with st.expander("Verification audit information"):
+        with st.expander("Advanced verification audit (troubleshooting)"):
             st.json(audit_data)
             st.download_button(
                 "Download verification audit JSON",

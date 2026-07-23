@@ -337,6 +337,59 @@ def choose_consensus(
     )
 
 
+def _build_cell_result_from_variants(
+    cell: dict[str, Any],
+    variant_results: list[dict[str, Any]],
+) -> CellOCRResult:
+    """Build one result from already-recognized preprocessing variants."""
+
+    (
+        consensus_prediction,
+        agreement_count,
+        consensus_confidence,
+        consensus_is_ambiguous,
+    ) = choose_consensus(variant_results)
+    correction = correct_numeric_prediction(
+        prediction=consensus_prediction,
+        reading_type=cell["reading_type"],
+    )
+    review_reasons: list[str] = []
+    if consensus_is_ambiguous:
+        review_reasons.append("The OCR variants produced an unresolved tie.")
+    if correction.needs_review or correction.changed:
+        review_reasons.append(correction.reason)
+
+    return CellOCRResult(
+        filename=cell["filename"],
+        day=cell["day"],
+        point=cell["point"],
+        reading_type=cell["reading_type"],
+        predictions={
+            result["variant"]: result["normalized_text"]
+            for result in variant_results
+        },
+        confidences={
+            result["variant"]: round(result["confidence"], 4)
+            for result in variant_results
+        },
+        raw_predictions={
+            result["variant"]: result["raw_text"]
+            for result in variant_results
+        },
+        consensus_prediction=consensus_prediction,
+        agreement_count=agreement_count,
+        average_consensus_confidence=round(consensus_confidence, 4),
+        final_value=correction.corrected_text,
+        needs_review=bool(review_reasons),
+        review_reason=(
+            " ".join(review_reasons) if review_reasons else correction.reason
+        ),
+        ocr_uncertainty_reasons=tuple(review_reasons),
+        postprocessing_status=correction.status,
+        candidate_interpretations=correction.candidate_interpretations,
+    )
+
+
 def process_measurement_cells(
     model: TextRecognition,
     cells: list[dict[str, Any]],
@@ -401,99 +454,13 @@ def process_measurement_cells(
             }
         )
 
-    final_results = []
-
-    for cell in cells:
-        filename = cell["filename"]
-        variant_results = grouped_jobs[filename]
-
-        (
-            consensus_prediction,
-            agreement_count,
-            consensus_confidence,
-            consensus_is_ambiguous,
-        ) = choose_consensus(
-            variant_results
+    final_results = [
+        _build_cell_result_from_variants(
+            cell,
+            grouped_jobs[cell["filename"]],
         )
-
-        correction = correct_numeric_prediction(
-            prediction=consensus_prediction,
-            reading_type=cell["reading_type"],
-        )
-
-        review_reasons = []
-
-        if consensus_is_ambiguous:
-            review_reasons.append(
-                "The OCR variants produced an unresolved tie."
-            )
-
-        if correction.needs_review:
-            review_reasons.append(
-                correction.reason
-            )
-
-        elif correction.changed:
-            review_reasons.append(
-                correction.reason
-            )
-
-        needs_review = bool(
-            review_reasons
-        )
-
-        if needs_review:
-            final_value = correction.corrected_text
-            review_reason = " ".join(
-                review_reasons
-            )
-        else:
-            final_value = correction.corrected_text
-            review_reason = correction.reason
-
-        predictions = {
-            result["variant"]: result["normalized_text"]
-            for result in variant_results
-        }
-
-        raw_predictions = {
-            result["variant"]: result["raw_text"]
-            for result in variant_results
-        }
-
-        confidences = {
-            result["variant"]: round(
-                result["confidence"],
-                4,
-            )
-            for result in variant_results
-        }
-
-        final_results.append(
-            CellOCRResult(
-                filename=filename,
-                day=cell["day"],
-                point=cell["point"],
-                reading_type=cell["reading_type"],
-                predictions=predictions,
-                confidences=confidences,
-                raw_predictions=raw_predictions,
-                consensus_prediction=consensus_prediction,
-                agreement_count=agreement_count,
-                average_consensus_confidence=round(
-                    consensus_confidence,
-                    4,
-                ),
-                final_value=final_value,
-                needs_review=needs_review,
-                review_reason=review_reason,
-                ocr_uncertainty_reasons=tuple(review_reasons),
-                postprocessing_status=correction.status,
-                candidate_interpretations=(
-                    correction.candidate_interpretations
-                ),
-            )
-        )
+        for cell in cells
+    ]
 
     if metrics is not None:
         metrics.add_seconds(
@@ -510,12 +477,165 @@ def process_measurement_cells(
         )
     return verified_results
 
+
+def process_measurement_cells_adaptive(
+    model: TextRecognition,
+    cells: list[dict[str, Any]],
+    metrics: ProcessingMetrics | None = None,
+) -> list[CellOCRResult]:
+    """Create fast grayscale proposals and retry unsafe text with consensus.
+
+    A single grayscale result is retained only when PaddleOCR returned an
+    already-valid one-decimal value without character normalization or numeric
+    repair. These proposals deliberately keep 1/3 agreement and therefore
+    require human confirmation. Empty, malformed, normalized, or out-of-range
+    first-pass text is rerun through the existing three-variant consensus path.
+    """
+
+    preprocessing_start = time.perf_counter()
+    grayscale_jobs: list[dict[str, Any]] = []
+    for cell in cells:
+        grayscale = create_ocr_variants(cell["image"])["grayscale"]
+        grayscale_jobs.append(
+            {
+                "cell": cell,
+                "image": prepare_for_ocr(grayscale),
+            }
+        )
+    if metrics is not None:
+        metrics.add_seconds(
+            "ocr_preprocessing_seconds",
+            time.perf_counter() - preprocessing_start,
+        )
+        metrics.adaptive_first_pass_cell_count += len(cells)
+
+    grayscale_results = recognize_prepared_images(
+        model=model,
+        images=[job["image"] for job in grayscale_jobs],
+        metrics=metrics,
+    )
+
+    fast_results: dict[str, CellOCRResult] = {}
+    fallback_cells: list[dict[str, Any]] = []
+    first_pass_variants: dict[str, dict[str, Any]] = {}
+    for job, recognized in zip(grayscale_jobs, grayscale_results):
+        cell = job["cell"]
+        first_pass_variants[cell["filename"]] = {
+            "filename": cell["filename"],
+            "day": cell["day"],
+            "point": cell["point"],
+            "reading_type": cell["reading_type"],
+            "variant": "grayscale",
+            **recognized,
+        }
+        raw_text = recognized["raw_text"]
+        normalized_text = recognized["normalized_text"]
+        correction = correct_numeric_prediction(
+            normalized_text,
+            cell["reading_type"],
+        )
+        safe_single_pass = (
+            raw_text == normalized_text
+            and correction.status == "valid_unchanged"
+            and not correction.changed
+            and not correction.needs_review
+        )
+        if not safe_single_pass:
+            fallback_cells.append(cell)
+            continue
+
+        fast_results[cell["filename"]] = CellOCRResult(
+            filename=cell["filename"],
+            day=cell["day"],
+            point=cell["point"],
+            reading_type=cell["reading_type"],
+            predictions={"grayscale": normalized_text},
+            raw_predictions={"grayscale": raw_text},
+            confidences={"grayscale": round(recognized["confidence"], 4)},
+            consensus_prediction=normalized_text,
+            agreement_count=1,
+            average_consensus_confidence=round(recognized["confidence"], 4),
+            final_value=correction.corrected_text,
+            needs_review=True,
+            review_reason=(
+                "Fast OCR proposal used one image variant and requires "
+                "confirmation against the extracted crop."
+            ),
+            ocr_uncertainty_reasons=(
+                "Fast OCR proposal used one image variant to reduce processing "
+                "time.",
+            ),
+            postprocessing_status=correction.status,
+            candidate_interpretations=correction.candidate_interpretations,
+        )
+
+    if metrics is not None:
+        metrics.adaptive_fallback_cell_count += len(fallback_cells)
+
+    fallback_results: list[CellOCRResult] = []
+    if fallback_cells:
+        fallback_preprocessing_start = time.perf_counter()
+        fallback_jobs: list[dict[str, Any]] = []
+        for cell in fallback_cells:
+            variants = create_ocr_variants(cell["image"])
+            for variant_name in ("original", "contrast"):
+                fallback_jobs.append(
+                    {
+                        "filename": cell["filename"],
+                        "day": cell["day"],
+                        "point": cell["point"],
+                        "reading_type": cell["reading_type"],
+                        "variant": variant_name,
+                        "image": prepare_for_ocr(variants[variant_name]),
+                    }
+                )
+        if metrics is not None:
+            metrics.add_seconds(
+                "ocr_preprocessing_seconds",
+                time.perf_counter() - fallback_preprocessing_start,
+            )
+        recognized_fallbacks = recognize_prepared_images(
+            model=model,
+            images=[job["image"] for job in fallback_jobs],
+            metrics=metrics,
+        )
+        fallback_variants: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for cell in fallback_cells:
+            fallback_variants[cell["filename"]].append(
+                first_pass_variants[cell["filename"]]
+            )
+        for job, recognized in zip(fallback_jobs, recognized_fallbacks):
+            fallback_variants[job["filename"]].append(
+                {**job, **recognized}
+            )
+        fallback_postprocessing_start = time.perf_counter()
+        fallback_results = [
+            _build_cell_result_from_variants(
+                cell,
+                fallback_variants[cell["filename"]],
+            )
+            for cell in fallback_cells
+        ]
+        if metrics is not None:
+            metrics.add_seconds(
+                "postprocessing_seconds",
+                time.perf_counter() - fallback_postprocessing_start,
+            )
+
+    result_by_filename = {
+        **fast_results,
+        **{result.filename: result for result in fallback_results},
+    }
+    ordered_results = [result_by_filename[cell["filename"]] for cell in cells]
+    return verify_cell_results(ordered_results)
+
 def process_measurement_cells_in_batches(
     model: TextRecognition,
     cells: list[dict[str, Any]],
     cells_per_batch: int = 32,
     progress_callback: Callable[[int, int], None] | None = None,
     metrics: ProcessingMetrics | None = None,
+    recognition_strategy: str = "consensus",
 ) -> list[CellOCRResult]:
     """
     Process a large collection of cells in smaller batches.
@@ -527,6 +647,10 @@ def process_measurement_cells_in_batches(
     if cells_per_batch <= 0:
         raise ValueError(
             "cells_per_batch must be greater than zero."
+        )
+    if recognition_strategy not in {"consensus", "adaptive"}:
+        raise ValueError(
+            "recognition_strategy must be 'consensus' or 'adaptive'."
         )
 
     all_results: list[CellOCRResult] = []
@@ -547,11 +671,12 @@ def process_measurement_cells_in_batches(
             start_index:end_index
         ]
 
-        batch_results = process_measurement_cells(
-            model=model,
-            cells=cell_batch,
-            metrics=metrics,
+        processor = (
+            process_measurement_cells_adaptive
+            if recognition_strategy == "adaptive"
+            else process_measurement_cells
         )
+        batch_results = processor(model=model, cells=cell_batch, metrics=metrics)
 
         all_results.extend(
             batch_results
@@ -580,6 +705,7 @@ def process_measurement_cells_with_blank_detection(
     cells_per_batch: int = 32,
     progress_callback: Callable[[int, int], None] | None = None,
     metrics: ProcessingMetrics | None = None,
+    recognition_strategy: str = "consensus",
 ) -> list[CellOCRResult]:
     """
     Classify blank cells before OCR.
@@ -595,6 +721,13 @@ def process_measurement_cells_with_blank_detection(
             metrics.filled_cell_count = 0
             metrics.blank_cell_count = 0
         return []
+
+    if recognition_strategy not in {"consensus", "adaptive"}:
+        raise ValueError(
+            "recognition_strategy must be 'consensus' or 'adaptive'."
+        )
+    if metrics is not None:
+        metrics.recognition_strategy = recognition_strategy
 
     total_cells = len(cells)
 
@@ -708,6 +841,7 @@ def process_measurement_cells_with_blank_detection(
             cells_per_batch=cells_per_batch,
             progress_callback=report_filled_progress,
             metrics=metrics,
+            recognition_strategy=recognition_strategy,
         )
     )
 

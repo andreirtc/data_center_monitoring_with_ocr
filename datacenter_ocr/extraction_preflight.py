@@ -9,6 +9,26 @@ REPRESENTATIVE_DAYS = (1, 16, 31)
 REPRESENTATIVE_POINT = 4
 
 
+def recommended_geometry_mode(summary: dict[str, Any]) -> str:
+    """Choose the safe initial UI selection from geometry-only evidence.
+
+    Local calibration is preferred only after a complete printed row sequence
+    is found, both modes contain all 496 cells, and no calibrated cell failed
+    geometry validation. Boundary-level fallbacks remain allowed because they
+    deliberately reuse the fixed coordinate for only the affected boundary.
+    """
+
+    calibrated_is_supported = all(
+        (
+            bool(summary.get("row_sequence_alignment_used")),
+            summary.get("fixed_cell_count") == 496,
+            summary.get("calibrated_cell_count") == 496,
+            summary.get("invalid_calibrated_cell_count") == 0,
+        )
+    )
+    return "calibrated" if calibrated_is_supported else "fixed"
+
+
 def build_alignment_preflight_summary(
     fixed_sheet: PreparedMonitoringSheet,
     calibrated_sheet: PreparedMonitoringSheet,

@@ -13,15 +13,18 @@ shown with their extracted handwritten crops for verification.
 - Detects and straightens a photographed monitoring table.
 - Detects the complete printed Day 1-31 row span before building either grid.
 - Shows straight fixed and locally calibrated extraction previews before OCR.
-- Keeps fixed extraction as the conservative initial choice.
+- Recommends locally calibrated extraction only when complete-sheet geometry
+  guards pass; fixed remains the backend default and recovery option.
 - Extracts 496 measurement cells: 31 days x 8 points x 2 readings.
 - Detects blank cells before OCR.
-- Runs three image variants through PaddleOCR.
+- Runs a grayscale proposal first and reuses it in a three-variant fallback
+  only for malformed, normalized, or out-of-range text.
 - Records OCR agreement and confidence.
 - Validates format, absolute limits, blank consistency, and anomalies.
 - Provides a primary 31-day verification workspace with all eight points and
   exact handwritten crops for the selected day.
-- Provides secondary image-assisted table editing and detailed cell review.
+- Provides secondary image-assisted table editing, with raw OCR details hidden
+  under an advanced troubleshooting section.
 - Applies partial, filename-keyed updates without rerunning OCR.
 - Exports into a copy of the official Excel template while preserving its
   formatting, formulas, borders, logos, and print layout.
@@ -46,9 +49,10 @@ CPU. The custom work is the domain-specific pipeline around the model:
 1. Detect and straighten the fixed company form.
 2. Extract each known temperature and humidity cell.
 3. Detect blanks before recognition.
-4. Create original, grayscale, and contrast-enhanced OCR inputs.
+4. Create a grayscale first-pass OCR input.
 5. Enlarge and pad each crop before batch recognition.
-6. Select a consensus result from the three OCR variants.
+6. Retain an already-valid first-pass proposal for human confirmation, or run
+   original and contrast inputs and select a three-variant consensus.
 7. Apply conservative numeric postprocessing and verification rules.
 8. Require human confirmation when a result is uncertain or ambiguous.
 
@@ -63,13 +67,13 @@ Upload image
     -> detect the complete 32-boundary Day 1-31 row sequence
     -> prepare straight fixed and locally calibrated previews without OCR
     -> inspect overlays, representative crops, metrics, and warnings
-    -> explicitly choose fixed or locally calibrated extraction
+    -> accept or override the guarded geometry recommendation
     -> run OCR
     -> extract 496 cells using the chosen geometry
     -> classify blank cells
     -> preprocess nonblank crops
-    -> run pretrained PaddleOCR
-    -> select consensus predictions
+    -> run grayscale PaddleOCR proposals
+    -> reuse the first pass in three-variant fallback only when needed
     -> verify and flag readings
     -> verify each day and apply sparse filename-keyed corrections
     -> export the official Excel workbook
@@ -148,9 +152,11 @@ Next**. A successful confirmation saves only that day's controls, confirms all
 partial corrections without confirming the day. Editing a confirmed day later
 through any interface invalidates that day's confirmation.
 
-Full Monitoring Table, Detailed Review, Sheet Previews, and Export Excel remain
-secondary tabs. All edits update the same canonical `CellOCRResult` objects
-through the filename-keyed sparse patch engine and do not rerun OCR.
+Full Monitoring Table, Sheet Previews, and Export Excel remain secondary tabs.
+Raw OCR variants and confidence values are available only in the collapsed
+advanced troubleshooting section. All edits update the same canonical
+`CellOCRResult` objects through the filename-keyed sparse patch engine and do
+not rerun OCR.
 
 Day confirmations and unfinished corrections persist only in the active
 Streamlit session. Closing the browser session or stopping Streamlit clears
@@ -213,7 +219,9 @@ The runner refuses incomplete or invalid labels before PaddleOCR is imported.
 It constructs the model once, measures first-inference warm-up separately, and
 uses the same production blank detection, three preprocessing variants,
 batching, postprocessing, and verification for both crop modes. Benchmark
-reports are evidence only and do not change the fixed production default.
+reports are evidence only. The reusable extraction backend keeps its fixed
+default, while Streamlit recommends calibrated extraction only when its
+geometry-only guards pass.
 
 Stage 3B evaluates blankness on an aspect-preserving `112 x 40` analysis
 canvas, with the same interpolation, border exclusion, component filtering,
@@ -231,11 +239,22 @@ calibrated modes in both execution orders. It also derives a benchmark-only
 hybrid: stable low-drift sheets retain fixed crops, materially drifted sheets
 select calibrated crops, and calibrated selections or cross-mode
 disagreements remain confirmation-required. The hybrid is not used by
-Streamlit, does not select using ground truth, and does not change the fixed
-production geometry default.
+Streamlit, does not select using ground truth, and does not control the
+geometry-only recommendation shown by the application.
 
-The Streamlit pipeline records observational stage timings and inference
-counters in the processing-results diagnostics expander. The development
+The same limited runner can evaluate the adaptive proposal path without a
+full-sheet OCR run:
+
+```powershell
+.\.venv\Scripts\python.exe -B scripts\run_geometry_ocr_benchmark.py `
+    --labels local_benchmark\geometry_ab\labels.csv `
+    --output local_benchmark\geometry_ab\results_adaptive `
+    --recognition-strategy adaptive
+```
+
+The Streamlit pipeline records observational stage timings, recognition
+strategy, adaptive fallback counts, and inference counters in the advanced
+processing diagnostics expander. The development
 full-sheet runner also writes `processing_metrics.json` and a complete
 machine-readable `cell_results.csv` under `output/full_sheet_ocr/`.
 
@@ -256,8 +275,9 @@ The following folders serve different purposes:
 Images under `output/`, `test_images/`, and `local_benchmark/` do not make live
 OCR faster. They are useful for development, evaluation, troubleshooting, and
 demonstrations. Runtime speed mainly benefits from keeping the virtual
-environment installed, retaining PaddleOCR's model cache, and reusing the
-model loaded by Streamlit during the active session.
+environment installed, retaining PaddleOCR's model cache, reusing the model
+loaded by Streamlit, and avoiding unnecessary second and third OCR inputs
+through adaptive proposals.
 
 ## Excel export
 
