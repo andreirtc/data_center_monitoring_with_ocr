@@ -141,6 +141,84 @@ class StreamlitDayVerificationContractTests(unittest.TestCase):
         source = (PROJECT_ROOT / "streamlit_app.py").read_text(encoding="utf-8")
         self.assertIn('recognition_strategy="adaptive"', source)
 
+    def test_ocr_is_submitted_to_single_background_worker(self) -> None:
+        source = (PROJECT_ROOT / "streamlit_app.py").read_text(encoding="utf-8")
+        worker_source = (
+            PROJECT_ROOT / "datacenter_ocr" / "background_ocr.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('"Queue OCR with {geometry_choice} extraction"', source)
+        self.assertIn("OCRJobRequest(", source)
+        self.assertNotIn(
+            "process_measurement_cells_with_blank_detection(",
+            source,
+        )
+        self.assertIn("ThreadPoolExecutor(", worker_source)
+        self.assertIn("max_workers=1", worker_source)
+        self.assertNotIn("streamlit", worker_source)
+
+    def test_background_status_refreshes_only_the_completed_active_sheet(
+        self,
+    ) -> None:
+        source = (PROJECT_ROOT / "streamlit_app.py").read_text(encoding="utf-8")
+
+        self.assertIn('@st.fragment(run_every="2s")', source)
+        self.assertIn('"Waiting for OCR"', source)
+        self.assertIn('"OCR running ·', source)
+        self.assertIn("collect_completed_background_jobs(", source)
+        self.assertIn("snapshot.sheet_id == active_sheet_id", source)
+        self.assertIn('st.rerun(scope="app")', source)
+        self.assertIn(
+            '"sheet when you are ready to load its proposals."',
+            source,
+        )
+
+    def test_completed_sheet_switch_skips_heavy_preflight_by_default(self) -> None:
+        source = (PROJECT_ROOT / "streamlit_app.py").read_text(encoding="utf-8")
+
+        self.assertIn("processed_result_available = (", source)
+        self.assertIn(
+            '"Show extraction diagnostics or OCR replacement controls"',
+            source,
+        )
+        self.assertIn(
+            "if show_extraction_diagnostics and (",
+            source,
+        )
+        self.assertIn(
+            "key == \"prepared_sheet\"",
+            source,
+        )
+
+    def test_uploaded_document_image_is_rendered_lazily(self) -> None:
+        source = (PROJECT_ROOT / "streamlit_app.py").read_text(encoding="utf-8")
+
+        self.assertIn(
+            'uploaded_document_expander = st.expander(',
+            source,
+        )
+        self.assertIn(
+            "if uploaded_document_expander.open:",
+            source,
+        )
+        self.assertIn(
+            'on_change="rerun"',
+            source,
+        )
+
+    def test_large_result_previews_render_only_on_the_selected_tab(self) -> None:
+        source = (PROJECT_ROOT / "streamlit_app.py").read_text(encoding="utf-8")
+
+        self.assertIn(
+            'key=f"results_tab_{uploaded_fingerprint}"',
+            source,
+        )
+        self.assertIn("if preview_tab.open:", source)
+        self.assertIn(
+            'key=f"result_grid_overlay_{uploaded_fingerprint}"',
+            source,
+        )
+
     def test_preflight_summary_optional_keys_are_hot_reload_safe(self) -> None:
         source = (PROJECT_ROOT / "streamlit_app.py").read_text(encoding="utf-8")
         self.assertIn('alignment_summary.get("warnings", ())', source)

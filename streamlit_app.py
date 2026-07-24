@@ -5,15 +5,20 @@ import hashlib
 import json
 import time
 from collections import Counter
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from typing import Any
+import uuid
 
 import cv2
 import numpy as np
 import pandas as pd
-from paddleocr import TextRecognition
 import streamlit as st
 
+from datacenter_ocr.background_ocr import (
+    BackgroundOCRManager,
+    OCRJobRequest,
+    OCRJobResult,
+)
 from datacenter_ocr.excel_export import (
     build_excel_mapping_audit,
     create_monitoring_workbook,
@@ -44,7 +49,6 @@ from datacenter_ocr.monitoring_records import (
 )
 from datacenter_ocr.ocr_processing import (
     CellOCRResult,
-    process_measurement_cells_with_blank_detection,
 )
 from datacenter_ocr.processing_metrics import ProcessingMetrics
 from datacenter_ocr.review_workflow import (
@@ -138,29 +142,70 @@ export default function (component) {
 )
 
 
-@dataclass
-class OCRModelResource:
-    """Cached model plus observational cold/warm timing state."""
-
-    model: TextRecognition
-    construction_seconds: float
-    prediction_call_count: int = 0
-
-
 @st.cache_resource
-def load_ocr_model() -> OCRModelResource:
-    """Load PaddleOCR once and reuse it across Streamlit reruns."""
+def load_background_ocr_manager() -> BackgroundOCRManager:
+    """Create one process-wide, single-worker OCR queue."""
 
-    print("[OCR MODEL] Loading PaddleOCR model into memory...")
-    construction_start = time.perf_counter()
-    model = TextRecognition(device="cpu")
-    return OCRModelResource(
-        model=model,
-        construction_seconds=round(
-            time.perf_counter() - construction_start,
-            6,
-        ),
-    )
+    return BackgroundOCRManager()
+
+
+@st.fragment(run_every="2s")
+def render_background_ocr_monitor(owner_id: str) -> None:
+    """Show progress and collect an active sheet immediately after OCR."""
+
+    snapshots = load_background_ocr_manager().snapshots_for_owner(owner_id)
+    active_sheet_id = st.session_state.get("active_sheet_id")
+    if any(
+        snapshot.state == "succeeded"
+        and snapshot.sheet_id == active_sheet_id
+        for snapshot in snapshots
+    ):
+        # The full rerun collects the finished result before rendering. Limit
+        # this to the active sheet so an unrelated completion cannot interrupt
+        # edits being made on another sheet.
+        st.rerun(scope="app")
+
+    active_snapshots = [
+        snapshot
+        for snapshot in snapshots
+        if snapshot.state
+        in ("queued", "loading_model", "running", "succeeded", "failed")
+    ]
+    if not active_snapshots:
+        return
+
+    st.subheader("Background OCR")
+    for snapshot in active_snapshots:
+        with st.container(border=True):
+            if snapshot.state == "queued":
+                st.write(f"**{snapshot.source_filename}** · Waiting for OCR")
+            elif snapshot.state == "loading_model":
+                st.write(
+                    f"**{snapshot.source_filename}** · Loading OCR model"
+                )
+            elif snapshot.state == "running":
+                progress = (
+                    snapshot.processed_count / snapshot.total_count
+                    if snapshot.total_count
+                    else 0.0
+                )
+                st.progress(
+                    progress,
+                    text=(
+                        f"{snapshot.source_filename} · Processing cells "
+                        f"{snapshot.processed_count}/{snapshot.total_count}"
+                    ),
+                )
+            elif snapshot.state == "succeeded":
+                st.success(
+                    f"{snapshot.source_filename} finished OCR. Select that "
+                    "sheet when you are ready to load its proposals."
+                )
+            else:
+                st.error(
+                    f"{snapshot.source_filename} OCR failed: "
+                    f"{snapshot.error_message}"
+                )
 
 
 def convert_bgr_to_rgb(image: np.ndarray) -> np.ndarray:
@@ -203,11 +248,14 @@ def capture_active_sheet_state(*, archive_images: bool) -> dict[str, Any]:
 
 
 def restore_sheet_state(saved_state: dict[str, Any]) -> None:
-    """Restore one queue item's canonical graph into active session keys."""
+    """Restore active results while leaving optional preflight images archived."""
 
     restored_by_identity: dict[int, PreparedMonitoringSheet] = {}
     for key, value in saved_state.items():
-        if isinstance(value, ArchivedPreparedMonitoringSheet):
+        if (
+            key == "prepared_sheet"
+            and isinstance(value, ArchivedPreparedMonitoringSheet)
+        ):
             identity = id(value)
             if identity not in restored_by_identity:
                 restored_by_identity[identity] = restore_prepared_sheet(value)
@@ -245,8 +293,89 @@ def queue_item_state(sheet_id: str) -> dict[str, Any]:
     return queue[sheet_id].get("state", {})
 
 
-def queue_stage(sheet_id: str) -> str:
+def apply_background_ocr_result(result: OCRJobResult) -> None:
+    """Attach one completed worker result to its exact queue sheet."""
+
+    queue: dict[str, dict[str, Any]] = st.session_state["sheet_queue"]
+    entry = queue.get(result.sheet_id)
+    if entry is None:
+        return
+
+    active = st.session_state.get("active_sheet_id") == result.sheet_id
+    prepared_sheet: PreparedMonitoringSheet | ArchivedPreparedMonitoringSheet
+    if active:
+        prepared_sheet = restore_prepared_sheet(result.prepared_sheet)
+        target_state = st.session_state
+    else:
+        prepared_sheet = result.prepared_sheet
+        target_state = entry.setdefault("state", {})
+
+    target_state["prepared_sheet"] = prepared_sheet
+    target_state["cell_results"] = result.cell_results
+    target_state["monitoring_rows"] = result.monitoring_rows
+    target_state["processing_metrics"] = result.processing_metrics
+    target_state["processing_seconds"] = (
+        result.processing_metrics.total_sheet_processing_seconds
+    )
+    target_state["processed_fingerprint"] = result.sheet_id
+    target_state["processed_geometry_mode"] = result.geometry_mode
+    target_state["day_verification_state"] = DayVerificationState(
+        sheet_fingerprint=result.sheet_id
+    )
+    target_state["day_editor_version"] = 0
+    target_state["table_editor_version"] = 0
+    target_state.pop("cell_crop_data_urls", None)
+    st.session_state[f"selected_day_{result.sheet_id}"] = 1
+    entry["ocr_job_id"] = None
+
+
+def collect_completed_background_jobs(
+    manager: BackgroundOCRManager,
+    owner_id: str,
+) -> None:
+    """Collect successful worker results on the Streamlit main thread."""
+
+    queue: dict[str, dict[str, Any]] = st.session_state["sheet_queue"]
+    for entry in queue.values():
+        job_id = entry.get("ocr_job_id")
+        if not job_id:
+            continue
+        snapshot = manager.snapshot(job_id, owner_id)
+        if snapshot is None:
+            entry["ocr_job_id"] = None
+            continue
+        if snapshot.state != "succeeded":
+            continue
+        result = manager.consume_result(job_id, owner_id)
+        if result is not None:
+            apply_background_ocr_result(result)
+
+
+def queue_stage(
+    sheet_id: str,
+    manager: BackgroundOCRManager,
+    owner_id: str,
+) -> str:
     """Summarize one sheet without running geometry preparation or OCR."""
+
+    queue: dict[str, dict[str, Any]] = st.session_state["sheet_queue"]
+    job_id = queue[sheet_id].get("ocr_job_id")
+    if job_id:
+        snapshot = manager.snapshot(job_id, owner_id)
+        if snapshot is not None:
+            if snapshot.state == "queued":
+                return "Waiting for OCR"
+            if snapshot.state == "loading_model":
+                return "Loading OCR model"
+            if snapshot.state == "running":
+                return (
+                    f"OCR running · {snapshot.processed_count}/"
+                    f"{snapshot.total_count}"
+                )
+            if snapshot.state == "succeeded":
+                return "OCR finished"
+            if snapshot.state == "failed":
+                return "OCR failed · Retry"
 
     state = queue_item_state(sheet_id)
     results = state.get("cell_results")
@@ -646,6 +775,12 @@ st.write(
     "exact extracted handwriting crops before exporting the workbook."
 )
 
+background_ocr_manager = load_background_ocr_manager()
+background_ocr_owner_id = st.session_state.setdefault(
+    "background_ocr_owner_id",
+    uuid.uuid4().hex,
+)
+
 uploaded_files = st.file_uploader(
     "Upload monitoring sheets",
     type=["png", "jpg", "jpeg", "pdf"],
@@ -696,7 +831,11 @@ for uploaded_file in uploaded_files or ():
     for item in new_items:
         if item.sheet_id in sheet_queue:
             continue
-        sheet_queue[item.sheet_id] = {"item": item, "state": {}}
+        sheet_queue[item.sheet_id] = {
+            "item": item,
+            "state": {},
+            "ocr_job_id": None,
+        }
         sheet_queue_order.append(item.sheet_id)
     known_source_fingerprints.add(source_fingerprint)
 
@@ -706,6 +845,11 @@ for error_message in queue_upload_errors.values():
 if not sheet_queue_order:
     st.info("Upload one or more PNG, JPG, JPEG, or PDF scans to begin.")
     st.stop()
+
+collect_completed_background_jobs(
+    background_ocr_manager,
+    background_ocr_owner_id,
+)
 
 selected_sheet_id = st.session_state.get("selected_sheet_id")
 if selected_sheet_id not in sheet_queue_order:
@@ -730,7 +874,11 @@ with st.spinner("Switching the active sheet..."):
 queue_rows = [
     {
         "Sheet": sheet_queue[sheet_id]["item"].display_name,
-        "Stage": queue_stage(sheet_id),
+        "Stage": queue_stage(
+            sheet_id,
+            background_ocr_manager,
+            background_ocr_owner_id,
+        ),
     }
     for sheet_id in sheet_queue_order
 ]
@@ -743,6 +891,7 @@ st.dataframe(
         "Stage": st.column_config.TextColumn("Stage", width="medium"),
     },
 )
+render_background_ocr_monitor(background_ocr_owner_id)
 selected_index = sheet_queue_order.index(selected_sheet_id)
 queue_navigation = st.columns(2)
 queue_navigation[0].button(
@@ -854,26 +1003,68 @@ elif source_was_portrait and not active_queue_item.orientation_confident:
         "choose Rotate left or Rotate right before preparing extraction."
     )
 
-with st.expander("Uploaded document", expanded=False):
-    st.image(
-        convert_bgr_to_rgb(uploaded_image),
-        caption=source_display_name,
-        width="stretch",
-    )
+uploaded_document_expander = st.expander(
+    "Uploaded document",
+    expanded=False,
+    key=f"uploaded_document_{uploaded_fingerprint}",
+    on_change="rerun",
+)
+if uploaded_document_expander.open:
+    with uploaded_document_expander:
+        st.image(
+            convert_bgr_to_rgb(uploaded_image),
+            caption=source_display_name,
+            width="stretch",
+        )
 
 st.header("1. Extraction preflight")
-st.write(
-    "Prepare both extraction previews first. This geometry-only step does not "
-    "load the OCR model."
+processed_result_available = (
+    st.session_state.get("processed_fingerprint") == uploaded_fingerprint
+    and st.session_state.get("cell_results") is not None
 )
+show_extraction_diagnostics = True
+if processed_result_available:
+    st.success(
+        "Extraction and OCR are complete. Continue directly to verification."
+    )
+    show_extraction_diagnostics = st.toggle(
+        "Show extraction diagnostics or OCR replacement controls",
+        value=False,
+        key=f"show_extraction_diagnostics_{uploaded_fingerprint}",
+        help=(
+            "Open this only when you need to inspect the grid overlays, compare "
+            "representative crops, or replace this sheet's OCR results."
+        ),
+    )
+else:
+    st.write(
+        "Prepare both extraction previews first. This geometry-only step does "
+        "not load the OCR model."
+    )
 
-fixed_preflight_sheet: PreparedMonitoringSheet | None = st.session_state.get(
-    "fixed_preflight_sheet"
-)
-calibrated_preflight_sheet: PreparedMonitoringSheet | None = (
+fixed_preflight_sheet: (
+    PreparedMonitoringSheet | ArchivedPreparedMonitoringSheet | None
+) = st.session_state.get("fixed_preflight_sheet")
+calibrated_preflight_sheet: (
+    PreparedMonitoringSheet | ArchivedPreparedMonitoringSheet | None
+) = (
     st.session_state.get("calibrated_preflight_sheet")
 )
-if fixed_preflight_sheet is None or calibrated_preflight_sheet is None:
+if show_extraction_diagnostics:
+    if isinstance(fixed_preflight_sheet, ArchivedPreparedMonitoringSheet):
+        fixed_preflight_sheet = restore_prepared_sheet(fixed_preflight_sheet)
+        st.session_state["fixed_preflight_sheet"] = fixed_preflight_sheet
+    if isinstance(calibrated_preflight_sheet, ArchivedPreparedMonitoringSheet):
+        calibrated_preflight_sheet = restore_prepared_sheet(
+            calibrated_preflight_sheet
+        )
+        st.session_state["calibrated_preflight_sheet"] = (
+            calibrated_preflight_sheet
+        )
+
+if show_extraction_diagnostics and (
+    fixed_preflight_sheet is None or calibrated_preflight_sheet is None
+):
     if st.button(
         "Prepare extraction preview",
         type="primary",
@@ -935,7 +1126,11 @@ if fixed_preflight_sheet is None or calibrated_preflight_sheet is None:
             with st.expander("Technical error details"):
                 st.exception(error)
 
-if fixed_preflight_sheet is not None and calibrated_preflight_sheet is not None:
+if (
+    show_extraction_diagnostics
+    and isinstance(fixed_preflight_sheet, PreparedMonitoringSheet)
+    and isinstance(calibrated_preflight_sheet, PreparedMonitoringSheet)
+):
     alignment_report = st.session_state.get("alignment_report")
     if alignment_report is not None:
         # Refresh derived UI data after a hot reload so sessions created by an
@@ -1024,6 +1219,20 @@ if fixed_preflight_sheet is not None and calibrated_preflight_sheet is not None:
         )
 
     recommended_geometry = recommended_geometry_mode(alignment_summary)
+    preflight_job_id = sheet_queue[uploaded_fingerprint].get("ocr_job_id")
+    preflight_job_snapshot = (
+        background_ocr_manager.snapshot(
+            preflight_job_id,
+            background_ocr_owner_id,
+        )
+        if preflight_job_id
+        else None
+    )
+    geometry_is_locked_for_job = (
+        preflight_job_snapshot is not None
+        and preflight_job_snapshot.state
+        in ("queued", "loading_model", "running", "succeeded")
+    )
     geometry_choice = st.segmented_control(
         "Extraction geometry",
         options=["fixed", "calibrated"],
@@ -1034,7 +1243,13 @@ if fixed_preflight_sheet is not None and calibrated_preflight_sheet is not None:
         ),
         key=f"geometry_choice_{uploaded_fingerprint}",
         persist_state="session",
+        disabled=geometry_is_locked_for_job,
     )
+    if geometry_is_locked_for_job:
+        st.caption(
+            "Extraction geometry is locked to the version submitted to the "
+            "background OCR worker."
+        )
     if recommended_geometry == "calibrated":
         st.caption(
             "Locally calibrated extraction is recommended because the complete "
@@ -1051,22 +1266,61 @@ if fixed_preflight_sheet is not None and calibrated_preflight_sheet is not None:
         st.session_state.get("processed_fingerprint") == uploaded_fingerprint
         and st.session_state.get("processed_geometry_mode") == geometry_choice
     )
+    current_job_id = preflight_job_id
+    current_job_snapshot = preflight_job_snapshot
+    current_job_pending = (
+        current_job_snapshot is not None
+        and current_job_snapshot.state
+        in ("queued", "loading_model", "running", "succeeded")
+    )
+    retrying_failed_job = (
+        current_job_snapshot is not None
+        and current_job_snapshot.state == "failed"
+    )
     run_ocr = st.button(
-        f"Run OCR with {geometry_choice} extraction",
+        (
+            f"Retry OCR with {geometry_choice} extraction"
+            if retrying_failed_job
+            else f"Queue OCR with {geometry_choice} extraction"
+        ),
         type="primary",
         icon=":material/document_scanner:",
-        disabled=current_result_matches_choice,
+        disabled=current_result_matches_choice or current_job_pending,
     )
     st.caption(
-        "OCR uses a grayscale first pass. Already-valid proposals remain "
-        "confirmation-required; malformed, normalized, or out-of-range text "
-        "automatically receives the full three-variant consensus pass."
+        "One background worker processes explicitly queued sheets in order. "
+        "You may switch sheets and continue verification while OCR runs. "
+        "The worker uses a grayscale first pass and the existing adaptive "
+        "three-variant fallback."
     )
     if current_result_matches_choice:
         st.info(
             f"The current results already use {geometry_choice} extraction. "
             "Preview navigation and geometry selection do not rerun OCR."
         )
+    elif current_job_snapshot is not None:
+        if current_job_snapshot.state == "queued":
+            st.info("This sheet is waiting for the background OCR worker.")
+        elif current_job_snapshot.state == "loading_model":
+            st.info("The background worker is loading the OCR model.")
+        elif current_job_snapshot.state == "running":
+            st.info(
+                f"This sheet is processing in the background: "
+                f"{current_job_snapshot.processed_count}/"
+                f"{current_job_snapshot.total_count} cells."
+            )
+        elif current_job_snapshot.state == "succeeded":
+            st.success(
+                "Background OCR finished. The results will load on the next "
+                "sheet switch or saved action."
+            )
+        elif current_job_snapshot.state == "failed":
+            st.error(
+                "Background OCR failed. You may retry this sheet without "
+                "affecting the other queue items."
+            )
+            with st.expander("Technical error details"):
+                st.code(current_job_snapshot.error_message)
 
     if run_ocr:
         selected_sheet = (
@@ -1078,71 +1332,33 @@ if fixed_preflight_sheet is not None and calibrated_preflight_sheet is not None:
             st.session_state["preflight_processing_metrics"],
             extraction_geometry_mode=geometry_choice,
         )
-        progress_bar = st.progress(0)
-        progress_message = st.empty()
         try:
-            progress_message.write("Loading the OCR recognition model...")
-            ocr_resource = load_ocr_model()
-            processing_metrics.model_was_warm = (
-                ocr_resource.prediction_call_count > 0
-            )
-            processing_metrics.model_construction_seconds = (
-                0.0
-                if processing_metrics.model_was_warm
-                else ocr_resource.construction_seconds
-            )
-
-            def update_progress(processed_count: int, total_count: int) -> None:
-                """Report whole-sheet OCR progress after explicit submission."""
-
-                percentage = int(processed_count / total_count * 100)
-                progress_bar.progress(min(percentage, 100))
-                progress_message.write(
-                    f"Processing cells: {processed_count}/{total_count}"
+            if retrying_failed_job and current_job_id:
+                background_ocr_manager.discard_terminal_job(
+                    current_job_id,
+                    background_ocr_owner_id,
                 )
-
-            processed_results = process_measurement_cells_with_blank_detection(
-                model=ocr_resource.model,
-                cells=selected_sheet.cells,
-                cells_per_batch=CELLS_PER_PROCESSING_BATCH,
-                progress_callback=update_progress,
-                metrics=processing_metrics,
-                recognition_strategy="adaptive",
-            )
-            ocr_resource.prediction_call_count += (
-                processing_metrics.model_predict_call_count
-            )
-            record_start = time.perf_counter()
-            processed_rows = build_monitoring_rows(processed_results)
-            processing_metrics.monitoring_record_construction_seconds = round(
-                time.perf_counter() - record_start,
-                6,
-            )
-            processing_metrics.recalculate_total()
-            st.session_state["prepared_sheet"] = selected_sheet
-            st.session_state["cell_results"] = processed_results
-            st.session_state["monitoring_rows"] = processed_rows
-            st.session_state["processing_metrics"] = processing_metrics
-            st.session_state["processing_seconds"] = (
-                processing_metrics.total_sheet_processing_seconds
-            )
-            st.session_state["processed_fingerprint"] = uploaded_fingerprint
-            st.session_state["processed_geometry_mode"] = geometry_choice
-            st.session_state["day_verification_state"] = DayVerificationState(
-                sheet_fingerprint=uploaded_fingerprint
-            )
-            st.session_state[f"selected_day_{uploaded_fingerprint}"] = 1
-            st.session_state["day_editor_version"] = 0
-            st.session_state["table_editor_version"] = 0
-            st.session_state.pop("cell_crop_data_urls", None)
-            progress_bar.progress(100)
-            progress_message.success("OCR proposals are ready for day verification.")
+            with st.spinner("Adding this sheet to the background OCR queue..."):
+                archived_sheet = archive_prepared_sheet(selected_sheet)
+                request = OCRJobRequest(
+                    owner_id=background_ocr_owner_id,
+                    sheet_id=uploaded_fingerprint,
+                    source_filename=source_display_name,
+                    geometry_mode=geometry_choice,
+                    prepared_sheet=archived_sheet,
+                    processing_metrics=processing_metrics,
+                    cells_per_batch=CELLS_PER_PROCESSING_BATCH,
+                    recognition_strategy="adaptive",
+                )
+                job_id = background_ocr_manager.submit(request)
+                sheet_queue[uploaded_fingerprint]["ocr_job_id"] = job_id
+            st.rerun()
         except ValueError as error:
-            progress_message.empty()
             st.error(str(error))
         except Exception as error:
-            progress_message.empty()
-            st.error("An unexpected error occurred while processing the sheet.")
+            st.error(
+                "The sheet could not be added to the background OCR queue."
+            )
             with st.expander("Technical error details"):
                 st.exception(error)
 
@@ -1153,11 +1369,32 @@ cell_results: list[CellOCRResult] | None = st.session_state.get("cell_results")
 monitoring_rows: list[dict[str, Any]] | None = st.session_state.get(
     "monitoring_rows"
 )
+active_job_id = sheet_queue[uploaded_fingerprint].get("ocr_job_id")
+active_job_snapshot = (
+    background_ocr_manager.snapshot(
+        active_job_id,
+        background_ocr_owner_id,
+    )
+    if active_job_id
+    else None
+)
+active_job_blocks_saved_results = (
+    active_job_snapshot is not None
+    and active_job_snapshot.state
+    in ("queued", "loading_model", "running", "succeeded")
+)
+if active_job_blocks_saved_results and cell_results is not None:
+    st.warning(
+        "This sheet has replacement OCR in progress. Its previous verification "
+        "workspace is temporarily read-only; switch to another sheet until "
+        "the queued result is collected."
+    )
 
 if (
     prepared_sheet is not None
     and cell_results is not None
     and monitoring_rows is not None
+    and not active_job_blocks_saved_results
 ):
     crop_data_urls = st.session_state.get("cell_crop_data_urls")
     if crop_data_urls is None:
@@ -1253,7 +1490,9 @@ if (
             "Full Monitoring Table",
             "Sheet Previews",
             "Export Excel",
-        ]
+        ],
+        key=f"results_tab_{uploaded_fingerprint}",
+        on_change="rerun",
     )
 
     with day_tab:
@@ -1493,18 +1732,31 @@ if (
             expanded=False,
         )
 
-    with preview_tab:
-        st.subheader("Detected monitoring table")
-        st.image(
-            convert_bgr_to_rgb(prepared_sheet.detection_preview), width="stretch"
-        )
-        st.subheader("Straightened monitoring table")
-        st.image(convert_bgr_to_rgb(prepared_sheet.warped_table), width="stretch")
-        with st.expander("Show measurement-grid overlay"):
+    if preview_tab.open:
+        with preview_tab:
+            st.subheader("Detected monitoring table")
             st.image(
-                convert_bgr_to_rgb(prepared_sheet.measurement_grid_overlay),
+                convert_bgr_to_rgb(prepared_sheet.detection_preview),
                 width="stretch",
             )
+            st.subheader("Straightened monitoring table")
+            st.image(
+                convert_bgr_to_rgb(prepared_sheet.warped_table),
+                width="stretch",
+            )
+            grid_overlay_expander = st.expander(
+                "Show measurement-grid overlay",
+                key=f"result_grid_overlay_{uploaded_fingerprint}",
+                on_change="rerun",
+            )
+            if grid_overlay_expander.open:
+                with grid_overlay_expander:
+                    st.image(
+                        convert_bgr_to_rgb(
+                            prepared_sheet.measurement_grid_overlay
+                        ),
+                        width="stretch",
+                    )
 
     with table_tab:
         st.subheader("Editable monitoring table")

@@ -18,7 +18,10 @@ shown with their extracted handwritten crops for verification.
 - Automatically rotates confident sideways portrait scans using the form's
   asymmetric header, footer, measurement-grid, and remarks layout.
 - Offers a page-orientation override before extraction geometry is prepared.
-- Processes only the selected sheet; queue navigation never starts OCR.
+- Submits OCR only after an explicit per-sheet action; queue navigation never
+  starts OCR.
+- Runs explicitly queued sheets sequentially in one background worker so a
+  completed sheet can be verified while the next sheet processes.
 - Preserves each sheet's geometry, OCR, corrections, and confirmations while
   moving between queue items during the active Streamlit session.
 - Detects and straightens a photographed or scanned monitoring table.
@@ -148,12 +151,32 @@ awaiting geometry, geometry ready, verification progress, or export-ready.
 Select a sheet, inspect its fixed and locally calibrated geometry, explicitly
 run OCR for that sheet, verify and export it, then select the next sheet.
 
-There is deliberately no **Process all** action. Only the selected sheet is
-decoded into its active OpenCV image and only an explicit OCR button starts
-recognition. Inactive extraction previews and cell crops are losslessly
-PNG-compressed in session memory, then restored when that sheet is selected
-again. The cached PaddleOCR model is shared across sheets, so later sheets
-avoid model reconstruction but still require their own cell inference.
+There is deliberately no **Process all** action. Only an explicit **Queue OCR**
+action submits a geometry-prepared sheet. One background worker owns
+PaddleOCR, processes submitted sheets in order, and starts the next explicitly
+queued sheet automatically. While it runs, the user can switch to a completed
+sheet and continue day verification or export. Inactive extraction previews
+and cell crops are losslessly PNG-compressed in session memory, then restored
+when that sheet is selected again. The worker reuses one model across sheets,
+so later jobs avoid model reconstruction but still require their own cell
+inference.
+
+Background work and verification remain isolated by the sheet fingerprint.
+The worker receives immutable compressed crops, reports progress without
+writing Streamlit session state, and returns a fingerprint-tagged result. The
+main Streamlit thread applies that result only to the matching queue entry.
+There may be several explicitly submitted waiting jobs, but only one OCR
+inference runs at a time. When OCR finishes for the sheet currently on screen,
+the app refreshes once and opens its verification results automatically. A
+sheet finishing in the background does not force-refresh a different sheet
+that the user is actively verifying; selecting the completed sheet loads it.
+
+Returning to a completed sheet opens its verification workspace without
+rendering the large extraction overlays and representative crop comparison.
+Those diagnostics and OCR replacement controls remain available through an
+explicit toggle. Inactive fixed and calibrated preflight images stay
+compressed until those diagnostics are requested. Full result preview images
+also render only when the **Sheet Previews** tab is selected.
 
 For portrait scanner pages without trustworthy PDF rotation metadata, the app
 compares 90-degree left and right candidates using layout evidence only. It
@@ -343,9 +366,9 @@ The original template is never modified.
   table detection and OCR quality.
 - The queue is session-only; closing the browser session or stopping Streamlit
   clears queued sheets and unfinished verification.
-- Queue processing remains intentionally sequential because the CPU OCR model
-  is shared and running multiple sheets concurrently would increase RAM and CPU
-  pressure.
+- Background OCR remains intentionally single-worker. Multiple sheets may wait
+  in the queue, but concurrent PaddleOCR inference is avoided because it would
+  increase RAM and CPU pressure.
 - The extraction geometry is intentionally specialized for the supported
   Toyota monitoring-sheet layout.
 - Accuracy claims should be based on a manually labeled evaluation set rather
