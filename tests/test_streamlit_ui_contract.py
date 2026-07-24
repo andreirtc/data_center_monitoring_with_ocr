@@ -92,7 +92,13 @@ class StreamlitDayVerificationContractTests(unittest.TestCase):
         self.assertNotIn("Action", selectbox_labels)
 
     def test_navigation_and_day_callbacks_do_not_call_ocr(self) -> None:
-        callback_names = {"submit_day_callback", "previous_day_callback"}
+        callback_names = {
+            "activate_queue_sheet",
+            "lock_orientation_for_preflight",
+            "select_adjacent_queue_sheet",
+            "submit_day_callback",
+            "previous_day_callback",
+        }
         callbacks = {
             node.name: node
             for node in ast.walk(self.tree)
@@ -139,6 +145,45 @@ class StreamlitDayVerificationContractTests(unittest.TestCase):
         source = (PROJECT_ROOT / "streamlit_app.py").read_text(encoding="utf-8")
         self.assertIn('alignment_summary.get("warnings", ())', source)
         self.assertIn('alignment_summary.get("notices", ())', source)
+
+    def test_uploader_accepts_pdf_and_enables_sheet_queue(self) -> None:
+        uploader = next(
+            call
+            for call in ast.walk(self.tree)
+            if isinstance(call, ast.Call)
+            and _call_name(call) == "file_uploader"
+        )
+        type_keyword = next(
+            keyword for keyword in uploader.keywords if keyword.arg == "type"
+        )
+        self.assertIsInstance(type_keyword.value, ast.List)
+        accepted_types = [item.value for item in type_keyword.value.elts]
+        self.assertIn("pdf", accepted_types)
+        multiple_keyword = next(
+            keyword
+            for keyword in uploader.keywords
+            if keyword.arg == "accept_multiple_files"
+        )
+        self.assertIsInstance(multiple_keyword.value, ast.Constant)
+        self.assertTrue(multiple_keyword.value.value)
+        source = (PROJECT_ROOT / "streamlit_app.py").read_text(encoding="utf-8")
+        self.assertIn("Every PDF page", source)
+        self.assertIn("navigation never starts OCR", source)
+        self.assertNotIn('"Process all"', source)
+
+    def test_portrait_orientation_is_visible_and_locked_before_geometry(
+        self,
+    ) -> None:
+        source = (PROJECT_ROOT / "streamlit_app.py").read_text(encoding="utf-8")
+
+        self.assertIn('"Page orientation"', source)
+        self.assertIn('"Auto (rotate left)"', source)
+        self.assertIn('"Rotate right"', source)
+        self.assertIn("orientation_preflight_locked", source)
+        self.assertIn(
+            "Automatically rotated this portrait scan",
+            source,
+        )
 
 
 if __name__ == "__main__":

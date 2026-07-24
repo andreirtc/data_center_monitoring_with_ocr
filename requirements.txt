@@ -3,4 +3,5 @@ opencv-python==5.0.0.93
 paddleocr==3.7.0
 paddlepaddle==3.3.0
 pandas==3.0.3
+pymupdf==1.28.0
 streamlit==1.59.2

@@ -1,8 +1,9 @@
 # Data Center Monthly Monitoring OCR
 
 This OCR-assisted encoding application converts photographed or scanned Toyota
-Data Center Monthly Monitoring Sheets into human-verified temperature and
-humidity records and exports them into the official Excel template.
+Data Center Monthly Monitoring Sheets from PNG, JPEG, or PDF uploads
+into human-verified temperature and humidity records and exports them into the
+official Excel template.
 
 The system is designed as a human-in-the-loop workflow. OCR produces proposed
 readings, while uncertain, malformed, anomalous, or inconsistent readings are
@@ -10,7 +11,17 @@ shown with their extracted handwritten crops for verification.
 
 ## Main features
 
-- Detects and straightens a photographed monitoring table.
+- Accepts multiple PNG, JPG, JPEG, and PDF monitoring-sheet uploads.
+- Adds each uploaded image and every PDF page to a selectable sheet queue.
+- Uses a PDF's original full-page scanner raster when available; otherwise
+  renders the page at 300 DPI.
+- Automatically rotates confident sideways portrait scans using the form's
+  asymmetric header, footer, measurement-grid, and remarks layout.
+- Offers a page-orientation override before extraction geometry is prepared.
+- Processes only the selected sheet; queue navigation never starts OCR.
+- Preserves each sheet's geometry, OCR, corrections, and confirmations while
+  moving between queue items during the active Streamlit session.
+- Detects and straightens a photographed or scanned monitoring table.
 - Detects the complete printed Day 1-31 row span before building either grid.
 - Shows straight fixed and locally calibrated extraction previews before OCR.
 - Recommends locally calibrated extraction only when complete-sheet geometry
@@ -63,7 +74,12 @@ evaluation and calibration, not model-weight training.
 ## Processing workflow
 
 ```text
-Upload image
+Upload one or more images or PDFs
+    -> add each image and PDF page to the sheet queue
+    -> select one sheet
+    -> extract its original scanner raster or render the PDF page at 300 DPI
+    -> automatically orient confident sideways portrait scans
+    -> inspect or override orientation before geometry preparation
     -> detect the complete 32-boundary Day 1-31 row sequence
     -> prepare straight fixed and locally calibrated previews without OCR
     -> inspect overlays, representative crops, metrics, and warnings
@@ -119,8 +135,33 @@ Later runs reuse PaddleOCR's local model cache.
 Then open the local URL shown by Streamlit, normally
 `http://localhost:8501`.
 
-For best results, upload a clear photograph containing the complete table with
-minimal glare, blur, shadow, and perspective distortion.
+For best results, upload clear photographs or network-printer scans containing
+the complete table with minimal glare, blur, shadow, and perspective
+distortion. Multi-page PDFs are split into separate selectable sheets.
+Password-protected PDFs are not accepted.
+
+## Multi-sheet queue
+
+Upload April, May, June, or a multi-page PDF in one intake step. Each image or
+PDF page appears as an independent queue item with one of these stages:
+awaiting geometry, geometry ready, verification progress, or export-ready.
+Select a sheet, inspect its fixed and locally calibrated geometry, explicitly
+run OCR for that sheet, verify and export it, then select the next sheet.
+
+There is deliberately no **Process all** action. Only the selected sheet is
+decoded into its active OpenCV image and only an explicit OCR button starts
+recognition. Inactive extraction previews and cell crops are losslessly
+PNG-compressed in session memory, then restored when that sheet is selected
+again. The cached PaddleOCR model is shared across sheets, so later sheets
+avoid model reconstruction but still require their own cell inference.
+
+For portrait scanner pages without trustworthy PDF rotation metadata, the app
+compares 90-degree left and right candidates using layout evidence only. It
+does not use OCR output or expected reading values to choose orientation.
+Confident pages are rotated automatically and labeled in the interface.
+Ambiguous pages remain unchanged with a warning and a manual orientation
+control. Orientation becomes locked when extraction preparation begins so
+existing crops, corrections, and confirmations cannot silently shift.
 
 ## Verification behavior
 
@@ -300,6 +341,11 @@ The original template is never modified.
 - Handwriting recognition is not guaranteed to be 100% accurate.
 - Poor lighting, cropped borders, severe blur, or strong perspective can reduce
   table detection and OCR quality.
+- The queue is session-only; closing the browser session or stopping Streamlit
+  clears queued sheets and unfinished verification.
+- Queue processing remains intentionally sequential because the CPU OCR model
+  is shared and running multiple sheets concurrently would increase RAM and CPU
+  pressure.
 - The extraction geometry is intentionally specialized for the supported
   Toyota monitoring-sheet layout.
 - Accuracy claims should be based on a manually labeled evaluation set rather

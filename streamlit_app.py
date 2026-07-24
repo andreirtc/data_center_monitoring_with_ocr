@@ -57,6 +57,15 @@ from datacenter_ocr.sheet_processing import (
     prepare_calibrated_monitoring_sheet,
     prepare_monitoring_sheet,
 )
+from datacenter_ocr.sheet_queue import (
+    ArchivedPreparedMonitoringSheet,
+    SheetQueueItem,
+    archive_prepared_sheet,
+    build_sheet_queue_items,
+    decode_queue_image,
+    resolve_queue_rotation,
+    restore_prepared_sheet,
+)
 
 
 CELLS_PER_PROCESSING_BATCH = 32
@@ -68,6 +77,30 @@ REVIEW_ACTIONS = [
     "Enter correction",
     "Mark blank",
 ]
+ACTIVE_SHEET_STATE_KEYS = (
+    "fixed_preflight_sheet",
+    "calibrated_preflight_sheet",
+    "alignment_report",
+    "alignment_preflight_summary",
+    "preflight_processing_metrics",
+    "prepared_sheet",
+    "cell_results",
+    "monitoring_rows",
+    "processing_seconds",
+    "processing_metrics",
+    "processed_fingerprint",
+    "processed_geometry_mode",
+    "prepared_orientation_choice",
+    "orientation_preflight_locked",
+    "day_verification_state",
+    "day_editor_version",
+    "day_flash",
+    "day_scroll_request",
+    "table_editor_version",
+    "cell_crop_data_urls",
+    "review_flash",
+    "table_flash",
+)
 
 
 st.set_page_config(
@@ -130,16 +163,6 @@ def load_ocr_model() -> OCRModelResource:
     )
 
 
-def decode_uploaded_image(uploaded_bytes: bytes) -> np.ndarray:
-    """Decode uploaded PNG or JPEG bytes into an OpenCV image."""
-
-    byte_array = np.frombuffer(uploaded_bytes, dtype=np.uint8)
-    image = cv2.imdecode(byte_array, cv2.IMREAD_COLOR)
-    if image is None:
-        raise ValueError("The uploaded file could not be decoded as an image.")
-    return image
-
-
 def convert_bgr_to_rgb(image: np.ndarray) -> np.ndarray:
     """Convert OpenCV's BGR image format for Streamlit display."""
 
@@ -155,31 +178,116 @@ def create_file_fingerprint(uploaded_bytes: bytes) -> str:
 
 
 def clear_previous_results() -> None:
-    """Clear canonical results when the user uploads a different image."""
+    """Clear the canonical working graph before activating another sheet."""
 
-    for key in (
-        "fixed_preflight_sheet",
-        "calibrated_preflight_sheet",
-        "alignment_report",
-        "alignment_preflight_summary",
-        "preflight_processing_metrics",
-        "prepared_sheet",
-        "cell_results",
-        "monitoring_rows",
-        "processing_seconds",
-        "processing_metrics",
-        "processed_fingerprint",
-        "processed_geometry_mode",
-        "day_verification_state",
-        "day_editor_version",
-        "day_flash",
-        "day_scroll_request",
-        "table_editor_version",
-        "cell_crop_data_urls",
-        "review_flash",
-        "table_flash",
-    ):
+    for key in ACTIVE_SHEET_STATE_KEYS:
         st.session_state.pop(key, None)
+
+
+def capture_active_sheet_state(*, archive_images: bool) -> dict[str, Any]:
+    """Capture the active canonical graph, optionally compressing image arrays."""
+
+    captured: dict[str, Any] = {}
+    archived_by_identity: dict[int, ArchivedPreparedMonitoringSheet] = {}
+    for key in ACTIVE_SHEET_STATE_KEYS:
+        if key not in st.session_state:
+            continue
+        value = st.session_state[key]
+        if archive_images and isinstance(value, PreparedMonitoringSheet):
+            identity = id(value)
+            if identity not in archived_by_identity:
+                archived_by_identity[identity] = archive_prepared_sheet(value)
+            value = archived_by_identity[identity]
+        captured[key] = value
+    return captured
+
+
+def restore_sheet_state(saved_state: dict[str, Any]) -> None:
+    """Restore one queue item's canonical graph into active session keys."""
+
+    restored_by_identity: dict[int, PreparedMonitoringSheet] = {}
+    for key, value in saved_state.items():
+        if isinstance(value, ArchivedPreparedMonitoringSheet):
+            identity = id(value)
+            if identity not in restored_by_identity:
+                restored_by_identity[identity] = restore_prepared_sheet(value)
+            value = restored_by_identity[identity]
+        st.session_state[key] = value
+
+
+def activate_queue_sheet(sheet_id: str) -> None:
+    """Archive the previous sheet and activate the selected queue item."""
+
+    queue: dict[str, dict[str, Any]] = st.session_state["sheet_queue"]
+    previous_sheet_id = st.session_state.get("active_sheet_id")
+    if previous_sheet_id == sheet_id:
+        return
+
+    if previous_sheet_id in queue:
+        queue[previous_sheet_id]["state"] = capture_active_sheet_state(
+            archive_images=True
+        )
+
+    clear_previous_results()
+    saved_state = queue[sheet_id].get("state", {})
+    restore_sheet_state(saved_state)
+    queue[sheet_id]["state"] = {}
+    st.session_state["active_sheet_id"] = sheet_id
+    st.session_state["uploaded_fingerprint"] = sheet_id
+
+
+def queue_item_state(sheet_id: str) -> dict[str, Any]:
+    """Return current state for active or archived queue status rendering."""
+
+    if st.session_state.get("active_sheet_id") == sheet_id:
+        return capture_active_sheet_state(archive_images=False)
+    queue: dict[str, dict[str, Any]] = st.session_state["sheet_queue"]
+    return queue[sheet_id].get("state", {})
+
+
+def queue_stage(sheet_id: str) -> str:
+    """Summarize one sheet without running geometry preparation or OCR."""
+
+    state = queue_item_state(sheet_id)
+    results = state.get("cell_results")
+    if results:
+        day_state = state_for_sheet(
+            sheet_id,
+            state.get("day_verification_state"),
+        )
+        readiness = summarize_export_readiness(results, day_state)
+        if readiness.ready:
+            return "Export-ready"
+        return f"Verification · {len(readiness.confirmed_days)}/31 days"
+    if (
+        state.get("fixed_preflight_sheet") is not None
+        and state.get("calibrated_preflight_sheet") is not None
+    ):
+        return "Geometry ready"
+    return "Awaiting geometry"
+
+
+def select_adjacent_queue_sheet(direction: int) -> None:
+    """Move the selected queue item without starting processing."""
+
+    order: list[str] = st.session_state.get("sheet_queue_order", [])
+    current = st.session_state.get("selected_sheet_id")
+    if not order or current not in order:
+        return
+    current_index = order.index(current)
+    next_index = min(max(current_index + direction, 0), len(order) - 1)
+    st.session_state["selected_sheet_id"] = order[next_index]
+
+
+def lock_orientation_for_preflight(uploaded_fingerprint: str) -> None:
+    """Freeze the pixel orientation before geometry preparation starts."""
+
+    orientation_key = f"orientation_choice_{uploaded_fingerprint}"
+    st.session_state["prepared_orientation_choice"] = st.session_state.get(
+        orientation_key,
+        "auto",
+    )
+    st.session_state["orientation_preflight_locked"] = True
 
 
 def count_blank_cells(results: list[CellOCRResult]) -> int:
@@ -538,38 +646,218 @@ st.write(
     "exact extracted handwriting crops before exporting the workbook."
 )
 
-uploaded_file = st.file_uploader(
-    "Upload monitoring sheet",
-    type=["png", "jpg", "jpeg"],
+uploaded_files = st.file_uploader(
+    "Upload monitoring sheets",
+    type=["png", "jpg", "jpeg", "pdf"],
+    accept_multiple_files=True,
     help=(
-        "The complete monitoring table should be visible. Avoid strong "
-        "glare, blur, shadows, or cropped borders."
+        "Upload one or more PNG, JPG, JPEG, or PDF scans. Every PDF page "
+        "becomes a separate queue item. Avoid glare, blur, shadows, or "
+        "cropped borders."
     ),
 )
 
-if uploaded_file is None:
-    st.info("Upload a PNG, JPG, or JPEG image to begin.")
+sheet_queue: dict[str, dict[str, Any]] = st.session_state.setdefault(
+    "sheet_queue",
+    {},
+)
+sheet_queue_order: list[str] = st.session_state.setdefault(
+    "sheet_queue_order",
+    [],
+)
+queue_upload_errors: dict[str, str] = st.session_state.setdefault(
+    "queue_upload_errors",
+    {},
+)
+known_source_fingerprints = {
+    entry["item"].source_fingerprint for entry in sheet_queue.values()
+}
+
+for uploaded_file in uploaded_files or ():
+    uploaded_bytes = uploaded_file.getvalue()
+    source_fingerprint = create_file_fingerprint(uploaded_bytes)
+    if (
+        source_fingerprint in known_source_fingerprints
+        or source_fingerprint in queue_upload_errors
+    ):
+        continue
+    try:
+        with st.spinner(f"Adding {uploaded_file.name} to the sheet queue..."):
+            new_items = build_sheet_queue_items(
+                uploaded_bytes,
+                uploaded_file.name,
+            )
+    except ValueError as error:
+        queue_upload_errors[source_fingerprint] = (
+            f"{uploaded_file.name}: {error}"
+        )
+        continue
+
+    for item in new_items:
+        if item.sheet_id in sheet_queue:
+            continue
+        sheet_queue[item.sheet_id] = {"item": item, "state": {}}
+        sheet_queue_order.append(item.sheet_id)
+    known_source_fingerprints.add(source_fingerprint)
+
+for error_message in queue_upload_errors.values():
+    st.error(error_message)
+
+if not sheet_queue_order:
+    st.info("Upload one or more PNG, JPG, JPEG, or PDF scans to begin.")
     st.stop()
 
-uploaded_bytes = uploaded_file.getvalue()
-uploaded_fingerprint = create_file_fingerprint(uploaded_bytes)
+selected_sheet_id = st.session_state.get("selected_sheet_id")
+if selected_sheet_id not in sheet_queue_order:
+    st.session_state["selected_sheet_id"] = sheet_queue_order[0]
 
-if st.session_state.get("uploaded_fingerprint") != uploaded_fingerprint:
-    clear_previous_results()
-    st.session_state["uploaded_fingerprint"] = uploaded_fingerprint
+st.subheader("Sheet queue")
+st.caption(
+    "Inspect and process one selected sheet at a time. Switching sheets "
+    "preserves its geometry, OCR proposals, corrections, and confirmations; "
+    "navigation never starts OCR."
+)
+selected_sheet_id = st.selectbox(
+    "Selected sheet",
+    options=sheet_queue_order,
+    format_func=lambda sheet_id: sheet_queue[sheet_id]["item"].display_name,
+    key="selected_sheet_id",
+)
 
+with st.spinner("Switching the active sheet..."):
+    activate_queue_sheet(selected_sheet_id)
+
+queue_rows = [
+    {
+        "Sheet": sheet_queue[sheet_id]["item"].display_name,
+        "Stage": queue_stage(sheet_id),
+    }
+    for sheet_id in sheet_queue_order
+]
+st.dataframe(
+    queue_rows,
+    hide_index=True,
+    width="stretch",
+    column_config={
+        "Sheet": st.column_config.TextColumn("Sheet", width="large"),
+        "Stage": st.column_config.TextColumn("Stage", width="medium"),
+    },
+)
+selected_index = sheet_queue_order.index(selected_sheet_id)
+queue_navigation = st.columns(2)
+queue_navigation[0].button(
+    "Previous sheet",
+    icon=":material/arrow_back:",
+    disabled=selected_index == 0,
+    on_click=select_adjacent_queue_sheet,
+    args=(-1,),
+)
+queue_navigation[1].button(
+    "Next sheet",
+    icon=":material/arrow_forward:",
+    disabled=selected_index == len(sheet_queue_order) - 1,
+    on_click=select_adjacent_queue_sheet,
+    args=(1,),
+)
+
+active_queue_item: SheetQueueItem = sheet_queue[selected_sheet_id]["item"]
+uploaded_fingerprint = active_queue_item.sheet_id
+source_display_name = active_queue_item.display_name
+upload_decoding_seconds = active_queue_item.decoding_seconds
+orientation_choice = "auto"
+source_was_portrait = (
+    active_queue_item.source_height > active_queue_item.source_width
+)
+if source_was_portrait:
+    orientation_key = f"orientation_choice_{uploaded_fingerprint}"
+    st.session_state.setdefault(orientation_key, "auto")
+    auto_rotation_labels = {
+        "clockwise": "Auto (rotate right)",
+        "counterclockwise": "Auto (rotate left)",
+        "none": "Auto (needs review)",
+    }
+    geometry_already_prepared = (
+        st.session_state.get("fixed_preflight_sheet") is not None
+        or st.session_state.get("calibrated_preflight_sheet") is not None
+    )
+    if geometry_already_prepared:
+        st.session_state[orientation_key] = st.session_state.get(
+            "prepared_orientation_choice",
+            "auto",
+        )
+    orientation_is_locked = (
+        geometry_already_prepared
+        or st.session_state.get("orientation_preflight_locked", False)
+    )
+    orientation_choice = st.segmented_control(
+        "Page orientation",
+        options=["auto", "counterclockwise", "clockwise", "none"],
+        format_func=lambda choice: {
+            "auto": auto_rotation_labels[active_queue_item.auto_rotation],
+            "counterclockwise": "Rotate left",
+            "clockwise": "Rotate right",
+            "none": "Keep portrait",
+        }[choice],
+        key=orientation_key,
+        required=True,
+        disabled=orientation_is_locked,
+    )
+    if orientation_is_locked:
+        st.caption(
+            "Orientation is locked after extraction geometry is prepared so "
+            "saved crops and verification remain associated with the same "
+            "pixels."
+        )
+
+effective_rotation = resolve_queue_rotation(
+    active_queue_item,
+    orientation_choice,
+)
 try:
-    decoding_start = time.perf_counter()
-    uploaded_image = decode_uploaded_image(uploaded_bytes)
-    upload_decoding_seconds = time.perf_counter() - decoding_start
+    uploaded_image = decode_queue_image(
+        active_queue_item,
+        orientation_choice,
+    )
 except ValueError as error:
     st.error(str(error))
     st.stop()
 
-with st.expander("Uploaded image", expanded=False):
+if active_queue_item.source_kind == "pdf":
+    if active_queue_item.image_source == "embedded_scan":
+        st.caption(
+            f"Using the original full-page scanner image from PDF page "
+            f"{active_queue_item.page_number} of "
+            f"{active_queue_item.page_count} at approximately "
+            f"{active_queue_item.effective_dpi:.0f} DPI."
+        )
+    else:
+        st.caption(
+            f"Rendered PDF page {active_queue_item.page_number} of "
+            f"{active_queue_item.page_count} at "
+            f"{active_queue_item.render_dpi} DPI for the image-based "
+            "extraction pipeline."
+        )
+
+if effective_rotation != "none":
+    direction = "right" if effective_rotation == "clockwise" else "left"
+    if orientation_choice == "auto":
+        st.info(
+            f"Automatically rotated this portrait scan 90° {direction} using "
+            "the monitoring-sheet layout. Inspect the document before "
+            "preparing extraction."
+        )
+    else:
+        st.info(f"Applied the selected 90° rotation to the {direction}.")
+elif source_was_portrait and not active_queue_item.orientation_confident:
+    st.warning(
+        "Automatic orientation was inconclusive. Inspect the document and "
+        "choose Rotate left or Rotate right before preparing extraction."
+    )
+
+with st.expander("Uploaded document", expanded=False):
     st.image(
         convert_bgr_to_rgb(uploaded_image),
-        caption=uploaded_file.name,
+        caption=source_display_name,
         width="stretch",
     )
 
@@ -590,10 +878,12 @@ if fixed_preflight_sheet is None or calibrated_preflight_sheet is None:
         "Prepare extraction preview",
         type="primary",
         icon=":material/grid_view:",
+        on_click=lock_orientation_for_preflight,
+        args=(uploaded_fingerprint,),
     ):
         image_height, image_width = uploaded_image.shape[:2]
         preflight_metrics = ProcessingMetrics(
-            source_filename=uploaded_file.name,
+            source_filename=source_display_name,
             uploaded_fingerprint=uploaded_fingerprint,
             extraction_geometry_mode="fixed",
             uploaded_width=image_width,
@@ -631,9 +921,16 @@ if fixed_preflight_sheet is None or calibrated_preflight_sheet is None:
             st.session_state["alignment_report"] = alignment_report
             st.session_state["alignment_preflight_summary"] = alignment_summary
             st.session_state["preflight_processing_metrics"] = preflight_metrics
+            st.session_state["prepared_orientation_choice"] = (
+                orientation_choice
+            )
         except ValueError as error:
+            st.session_state.pop("orientation_preflight_locked", None)
+            st.session_state.pop("prepared_orientation_choice", None)
             st.error(str(error))
         except Exception as error:
+            st.session_state.pop("orientation_preflight_locked", None)
+            st.session_state.pop("prepared_orientation_choice", None)
             st.error("The extraction preview could not be prepared.")
             with st.expander("Technical error details"):
                 st.exception(error)
